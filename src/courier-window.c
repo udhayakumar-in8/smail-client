@@ -6,11 +6,29 @@
 #include "courier-composer.h"
 #include "courier-message-view.h"
 #include "courier-util.h"
+#include "courier-store.h"
+#include "courier-automation.h"
+#include "courier-lan.h"
+#include "courier-organizer.h"
+#include "courier-mail-tools.h"
+#include "courier-chat-page.h"
+#include "courier-ui.h"
 
 #include <string.h>
 
 #define MESSAGE_LIMIT        100
 #define AUTO_REFRESH_SECONDS (5 * 60)
+#define REMINDER_CHECK_SECONDS 15
+
+/* Organizer pages shown in place of the mail panes */
+static const struct { const char *id, *title, *icon; } tools[] = {
+  { "calendar",  "Calendar",   "x-office-calendar-symbolic" },
+  { "tasks",     "Tasks",      "checkbox-checked-symbolic" },
+  { "reminders", "Reminders",  "alarm-symbolic" },
+  { "chat",      "Local Chat", "network-workgroup-symbolic" },
+  { "log",       "Mail Log",   "document-open-recent-symbolic" },
+  { "filters",   "Filters",    "emblem-system-symbolic" },
+};
 
 typedef struct {
   CourierBackend *backend;
@@ -58,6 +76,22 @@ struct _CourierWindow {
   gboolean        rebuilding_sidebar;
   guint           refresh_source;
   int             pending_folder_lists;
+
+  /* local features */
+  CourierStore   *store;
+  CourierLan     *lan;
+  GtkWidget      *content_stack;
+  GtkWidget      *content_page;
+  GtkWidget      *calendar_page;
+  GtkWidget      *tasks_page;
+  GtkWidget      *reminders_page;
+  GtkWidget      *chat_page;
+  GtkWidget      *log_page;
+  GtkWidget      *filters_page;
+  char           *current_tool;   /* NULL = mail */
+  int             chat_unread;
+  guint           reminder_source;
+  gboolean        skip_welcome;
 };
 
 G_DEFINE_FINAL_TYPE (CourierWindow, courier_window, ADW_TYPE_APPLICATION_WINDOW)
@@ -67,6 +101,9 @@ static void rebuild_sidebar    (CourierWindow *self);
 static void update_actions     (CourierWindow *self);
 static void reload_accounts    (CourierWindow *self);
 static void refresh_all        (CourierWindow *self);
+static void check_new_mail     (CourierWindow *self, AccountCtx *ctx);
+static void update_filter_folders (CourierWindow *self);
+static void load_messages      (CourierWindow *self);
 
 static void
 toast (CourierWindow *self, const char *text)
@@ -124,7 +161,8 @@ folder_row_new (AccountCtx *ctx, CourierFolder *folder)
   GtkWidget *row = gtk_list_box_row_new ();
   gtk_list_box_row_set_child (GTK_LIST_BOX_ROW (row), box);
   g_object_set_data (G_OBJECT (row), "ctx", ctx);
-  g_object_set_data_full (G_OBJECT (row), "path", g_strdup (folder->path), g_free);
+  if (folder->path)
+    g_object_set_data_full (G_OBJECT (row), "path", g_strdup (folder->path), g_free);
   g_object_set_data (G_OBJECT (row), "badge", badge);
   return row;
 }
@@ -195,9 +233,49 @@ rebuild_sidebar (CourierWindow *self)
       GtkWidget *row = folder_row_new (ctx, f);
       update_badge (row, f);
       gtk_list_box_append (GTK_LIST_BOX (self->sidebar), row);
-      if (ctx == self->current_ctx && g_strcmp0 (self->current_folder, f->path) == 0)
+      if (!self->current_tool && ctx == self->current_ctx && g_strcmp0 (self->current_folder, f->path) == 0)
         to_select = row;
     }
+  }
+
+  if (self->ctxs->len == 0) {
+    GtkWidget *add = gtk_label_new ("No email account yet");
+    gtk_label_set_xalign (GTK_LABEL (add), 0);
+    gtk_widget_add_css_class (add, "dim-label");
+    gtk_widget_add_css_class (add, "sidebar-status");
+    GtkWidget *arow = gtk_list_box_row_new ();
+    gtk_list_box_row_set_child (GTK_LIST_BOX_ROW (arow), add);
+    gtk_list_box_row_set_selectable (GTK_LIST_BOX_ROW (arow), FALSE);
+    gtk_list_box_row_set_activatable (GTK_LIST_BOX_ROW (arow), FALSE);
+    gtk_list_box_append (GTK_LIST_BOX (self->sidebar), arow);
+  }
+
+  /* organizer */
+  GtkWidget *oheader = gtk_label_new ("Organizer");
+  gtk_label_set_xalign (GTK_LABEL (oheader), 0);
+  gtk_widget_add_css_class (oheader, "account-header");
+  GtkWidget *ohrow = gtk_list_box_row_new ();
+  gtk_list_box_row_set_child (GTK_LIST_BOX_ROW (ohrow), oheader);
+  gtk_list_box_row_set_activatable (GTK_LIST_BOX_ROW (ohrow), FALSE);
+  gtk_list_box_row_set_selectable (GTK_LIST_BOX_ROW (ohrow), FALSE);
+  gtk_list_box_append (GTK_LIST_BOX (self->sidebar), ohrow);
+  for (gsize i = 0; i < G_N_ELEMENTS (tools); i++) {
+    CourierFolder pseudo = { NULL, (char *) tools[i].title, NULL, 0 };
+    GtkWidget *row = folder_row_new (NULL, &pseudo);
+    GtkWidget *icon = gtk_widget_get_first_child (gtk_list_box_row_get_child (GTK_LIST_BOX_ROW (row)));
+    gtk_image_set_from_icon_name (GTK_IMAGE (icon), tools[i].icon);
+    g_object_set_data (G_OBJECT (row), "tool", (gpointer) tools[i].id);
+    if (g_str_equal (tools[i].id, "chat")) {
+      GtkWidget *badge = g_object_get_data (G_OBJECT (row), "badge");
+      g_autofree char *n = g_strdup_printf ("%d", self->chat_unread);
+      gtk_label_set_text (GTK_LABEL (badge), n);
+      gtk_widget_set_visible (badge, self->chat_unread > 0);
+    } else {
+      gtk_widget_set_visible (g_object_get_data (G_OBJECT (row), "badge"), FALSE);
+    }
+    gtk_list_box_append (GTK_LIST_BOX (self->sidebar), row);
+    if (g_strcmp0 (self->current_tool, tools[i].id) == 0)
+      to_select = row;
   }
 
   if (to_select)
@@ -206,14 +284,45 @@ rebuild_sidebar (CourierWindow *self)
 }
 
 static void
+show_tool (CourierWindow *self, const char *tool)
+{
+  g_free (self->current_tool);
+  self->current_tool = g_strdup (tool);
+  gtk_stack_set_visible_child_name (GTK_STACK (self->content_stack), tool ? tool : "mail");
+  courier_chat_page_set_active (self->chat_page, g_strcmp0 (tool, "chat") == 0);
+
+  const char *title = "Mail";
+  for (gsize i = 0; tool && i < G_N_ELEMENTS (tools); i++)
+    if (g_str_equal (tools[i].id, tool))
+      title = tools[i].title;
+  adw_navigation_page_set_title (ADW_NAVIGATION_PAGE (self->content_page), title);
+
+  /* pages read the database when shown, so they're always current */
+  if (g_strcmp0 (tool, "calendar") == 0)  courier_calendar_page_refresh (self->calendar_page);
+  if (g_strcmp0 (tool, "tasks") == 0)     courier_tasks_page_refresh (self->tasks_page);
+  if (g_strcmp0 (tool, "reminders") == 0) courier_reminders_page_refresh (self->reminders_page);
+  if (g_strcmp0 (tool, "log") == 0)       courier_mail_log_page_refresh (self->log_page);
+  if (g_strcmp0 (tool, "filters") == 0)   courier_filters_page_refresh (self->filters_page);
+}
+
+static void
 on_sidebar_row_activated (GtkListBox *box, GtkListBoxRow *row, CourierWindow *self)
 {
+  const char *tool = g_object_get_data (G_OBJECT (row), "tool");
+  if (tool) {
+    adw_navigation_split_view_set_show_content (ADW_NAVIGATION_SPLIT_VIEW (self->outer_split), TRUE);
+    show_tool (self, tool);
+    return;
+  }
   AccountCtx *ctx = g_object_get_data (G_OBJECT (row), "ctx");
   const char *path = g_object_get_data (G_OBJECT (row), "path");
   if (!ctx || !path)
     return;
   adw_navigation_split_view_set_show_content (ADW_NAVIGATION_SPLIT_VIEW (self->outer_split), TRUE);
-  if (ctx == self->current_ctx && g_strcmp0 (path, self->current_folder) == 0)
+  gboolean was_tool = self->current_tool != NULL;
+  if (was_tool)
+    show_tool (self, NULL);
+  if (!was_tool && ctx == self->current_ctx && g_strcmp0 (path, self->current_folder) == 0)
     return;
   select_folder (self, ctx, path);
 }
@@ -247,6 +356,9 @@ on_folders_listed (GObject *source, GAsyncResult *res, gpointer data)
     toast (self, msg);
   }
   rebuild_sidebar (self);
+  update_filter_folders (self);
+  if (folders)
+    check_new_mail (self, ctx);
 
   /* first time: open the inbox of the first account that has one */
   if (!self->current_ctx && ctx->folders && ctx->folders->len > 0) {
@@ -582,6 +694,347 @@ on_message_row_activated (GtkListBox *box, GtkListBoxRow *row, CourierWindow *se
 }
 
 /* ====================================================================== */
+/*  New mail: mail log + filters                                          */
+/* ====================================================================== */
+
+static const char *
+account_key (AccountCtx *ctx)
+{
+  return courier_backend_is_demo (ctx->backend) ? "demo" : courier_backend_get_account (ctx->backend)->email;
+}
+
+typedef struct {
+  CourierWindow *self;
+  int            pending;
+  int            moved;
+  int            changed;
+} FilterRun;
+
+static void
+filter_run_step_done (FilterRun *run)
+{
+  if (--run->pending > 0)
+    return;
+  CourierWindow *self = run->self;
+  if (run->moved || run->changed) {
+    for (guint i = 0; i < self->ctxs->len; i++)
+      list_folders (self, g_ptr_array_index (self->ctxs, i));
+    CourierFolder *f = current_folder (self);
+    if (!self->current_tool && f && g_strcmp0 (f->role, "inbox") == 0)
+      load_messages (self);
+  }
+  g_object_unref (self);
+  g_free (run);
+}
+
+static void
+on_filter_action_done (GObject *source, GAsyncResult *res, gpointer data)
+{
+  FilterRun *run = data;
+  g_autoptr (GError) error = NULL;
+  if (!courier_backend_finish_boolean (COURIER_BACKEND (source), res, &error)) {
+    g_autofree char *msg = g_strdup_printf ("A filter failed: %s", error->message);
+    toast (run->self, msg);
+  }
+  filter_run_step_done (run);
+}
+
+/* Apply the enabled filters to `messages` (CourierMessage*) in `folder`.
+ * Returns how many messages matched at least one rule. */
+static int
+apply_filters (CourierWindow *self, AccountCtx *ctx, const char *folder, GPtrArray *messages)
+{
+  g_autoptr (GPtrArray) filters = courier_store_list_filters (self->store);
+  if (filters->len == 0)
+    return 0;
+
+  FilterRun *run = g_new0 (FilterRun, 1);
+  run->self = g_object_ref (self);
+  run->pending = 1; /* released at the end */
+  int matched = 0;
+
+  for (guint i = 0; i < messages->len; i++) {
+    CourierMessage *m = g_ptr_array_index (messages, i);
+    gboolean any = FALSE;
+    for (guint j = 0; j < filters->len; j++) {
+      CourierFilter *f = g_ptr_array_index (filters, j);
+      if (!courier_filter_matches (f, m))
+        continue;
+      any = TRUE;
+      run->pending++;
+      if (g_str_equal (f->action, "move")) {
+        run->moved++;
+        courier_backend_move (ctx->backend, folder, m->uid, f->target, on_filter_action_done, run);
+      } else if (g_str_equal (f->action, "trash")) {
+        run->moved++;
+        courier_backend_trash (ctx->backend, folder, m->uid, on_filter_action_done, run);
+      } else if (g_str_equal (f->action, "read")) {
+        run->changed++;
+        courier_message_set_seen (m, TRUE);
+        courier_backend_set_flag (ctx->backend, folder, m->uid, "\\Seen", TRUE, on_filter_action_done, run);
+      } else if (g_str_equal (f->action, "star")) {
+        run->changed++;
+        courier_message_set_flagged (m, TRUE);
+        courier_backend_set_flag (ctx->backend, folder, m->uid, "\\Flagged", TRUE, on_filter_action_done, run);
+      } else {
+        run->pending--;
+      }
+      if (courier_filter_is_final (f))
+        break;
+    }
+    if (any)
+      matched++;
+  }
+  filter_run_step_done (run);
+  return matched;
+}
+
+typedef struct {
+  CourierWindow *self;
+  CourierBackend *backend;
+  char          *folder;
+  gboolean       run_all; /* "Run on Inbox": apply filters to everything */
+} InboxCheck;
+
+static void
+inbox_check_free (InboxCheck *c)
+{
+  g_object_unref (c->self);
+  g_object_unref (c->backend);
+  g_free (c->folder);
+  g_free (c);
+}
+
+static void
+on_inbox_checked (GObject *source, GAsyncResult *res, gpointer data)
+{
+  InboxCheck *check = data;
+  CourierWindow *self = check->self;
+  g_autoptr (GError) error = NULL;
+  g_autoptr (GPtrArray) msgs = courier_backend_finish_pointer (COURIER_BACKEND (source), res, &error);
+
+  AccountCtx *ctx = NULL;
+  for (guint i = 0; i < self->ctxs->len; i++)
+    if (((AccountCtx *) g_ptr_array_index (self->ctxs, i))->backend == check->backend)
+      ctx = g_ptr_array_index (self->ctxs, i);
+  if (!msgs || !ctx) {
+    if (check->run_all && error)
+      toast (self, error->message);
+    inbox_check_free (check);
+    return;
+  }
+
+  if (check->run_all) {
+    int n = apply_filters (self, ctx, check->folder, msgs);
+    g_autofree char *msg = n ? g_strdup_printf (n == 1 ? "Filters applied to 1 message"
+                                                       : "Filters applied to %d messages", n)
+                             : g_strdup ("No messages matched your filters");
+    toast (self, msg);
+    inbox_check_free (check);
+    return;
+  }
+
+  const char *key = account_key (ctx);
+  gboolean known = FALSE;
+  gint64 last = courier_store_get_last_uid (self->store, key, check->folder, &known);
+  gint64 highest = last;
+  const char *account_email = courier_backend_get_account (ctx->backend)->email;
+  g_autoptr (GPtrArray) fresh = g_ptr_array_new ();
+
+  for (guint i = 0; i < msgs->len; i++) {
+    CourierMessage *m = g_ptr_array_index (msgs, i);
+    gint64 uid = g_ascii_strtoll (m->uid, NULL, 10);
+    highest = MAX (highest, uid);
+    if (known && uid <= last)
+      continue;
+    /* record every message we haven't seen: the first sync records what's already there */
+    CourierMailLogEntry *e = courier_mail_log_from_message (m, account_email, check->folder);
+    courier_store_log_mail (self->store, e, NULL);
+    courier_mail_log_free (e);
+    if (known)
+      g_ptr_array_add (fresh, m);
+  }
+  courier_store_set_last_uid (self->store, key, check->folder, highest);
+
+  if (fresh->len > 0) {
+    apply_filters (self, ctx, check->folder, fresh);
+
+    g_autoptr (GNotification) n = NULL;
+    if (fresh->len == 1) {
+      CourierMessage *m = g_ptr_array_index (fresh, 0);
+      n = g_notification_new (courier_message_get_sender (m));
+      g_notification_set_body (n, m->subject);
+    } else {
+      g_autofree char *title = g_strdup_printf ("%u new messages", fresh->len);
+      n = g_notification_new (title);
+      g_notification_set_body (n, account_email);
+    }
+    g_notification_set_default_action (n, "app.activate");
+    g_application_send_notification (G_APPLICATION (gtk_window_get_application (GTK_WINDOW (self))),
+                                     "new-mail", n);
+    g_autofree char *msg = g_strdup_printf (fresh->len == 1 ? "1 new message" : "%u new messages", fresh->len);
+    toast (self, msg);
+  }
+  if (g_strcmp0 (self->current_tool, "log") == 0)
+    courier_mail_log_page_refresh (self->log_page);
+  inbox_check_free (check);
+}
+
+static void
+start_inbox_check (CourierWindow *self, AccountCtx *ctx, gboolean run_all)
+{
+  const CourierFolder *inbox = courier_backend_find_role (ctx->backend, "inbox");
+  if (!inbox)
+    return;
+  InboxCheck *check = g_new0 (InboxCheck, 1);
+  check->self = g_object_ref (self);
+  check->backend = g_object_ref (ctx->backend);
+  check->folder = g_strdup (inbox->path);
+  check->run_all = run_all;
+  courier_backend_list_messages (ctx->backend, inbox->path, MESSAGE_LIMIT, NULL, on_inbox_checked, check);
+}
+
+static void
+check_new_mail (CourierWindow *self, AccountCtx *ctx)
+{
+  start_inbox_check (self, ctx, FALSE);
+}
+
+static void
+run_filters_now (gpointer data)
+{
+  CourierWindow *self = data;
+  AccountCtx *ctx = self->current_ctx ? self->current_ctx
+                  : self->ctxs->len ? g_ptr_array_index (self->ctxs, 0) : NULL;
+  if (!ctx) {
+    toast (self, "Add an email account first");
+    return;
+  }
+  if (!courier_backend_find_role (ctx->backend, "inbox")) {
+    toast (self, "This account has no Inbox");
+    return;
+  }
+  start_inbox_check (self, ctx, TRUE);
+}
+
+static void
+update_filter_folders (CourierWindow *self)
+{
+  g_autoptr (GStrvBuilder) b = g_strv_builder_new ();
+  g_autoptr (GHashTable) seen = g_hash_table_new (g_str_hash, g_str_equal);
+  for (guint i = 0; i < self->ctxs->len; i++) {
+    AccountCtx *ctx = g_ptr_array_index (self->ctxs, i);
+    for (guint j = 0; ctx->folders && j < ctx->folders->len; j++) {
+      CourierFolder *f = g_ptr_array_index (ctx->folders, j);
+      if (g_strcmp0 (f->role, "inbox") == 0 || g_hash_table_contains (seen, f->path))
+        continue;
+      g_hash_table_add (seen, f->path);
+      g_strv_builder_add (b, f->path);
+    }
+  }
+  g_auto (GStrv) folders = g_strv_builder_end (b);
+  courier_filters_page_set_folders (self->filters_page, (const char * const *) folders);
+}
+
+/* ====================================================================== */
+/*  Reminders                                                             */
+/* ====================================================================== */
+
+static gboolean
+check_reminders (gpointer data)
+{
+  CourierWindow *self = data;
+  g_autoptr (GPtrArray) due = courier_store_due_reminders (self->store, courier_unix_now ());
+  GApplication *app = G_APPLICATION (gtk_window_get_application (GTK_WINDOW (self)));
+  for (guint i = 0; i < due->len; i++) {
+    CourierReminder *r = g_ptr_array_index (due, i);
+    courier_store_mark_fired (self->store, r->id);
+
+    g_autoptr (GNotification) n = g_notification_new ("Reminder");
+    g_notification_set_body (n, r->title);
+    g_notification_set_priority (n, G_NOTIFICATION_PRIORITY_HIGH);
+    g_notification_add_button_with_target_value (n, "Snooze 10 Minutes", "app.snooze-reminder",
+                                                 g_variant_new_int64 (r->id));
+    g_notification_set_default_action (n, "app.activate");
+    g_autofree char *nid = g_strdup_printf ("reminder-%" G_GINT64_FORMAT, r->id);
+    if (app)
+      g_application_send_notification (app, nid, n);
+
+    g_autofree char *text = g_strdup_printf ("🔔 %s", r->title);
+    AdwToast *t = adw_toast_new (text);
+    adw_toast_set_timeout (t, 0); /* stays until dismissed */
+    adw_toast_set_button_label (t, "Snooze 10 min");
+    adw_toast_set_action_name (t, "win.snooze-reminder");
+    adw_toast_set_action_target_value (t, g_variant_new_int64 (r->id));
+    adw_toast_overlay_add_toast (ADW_TOAST_OVERLAY (self->toast_overlay), t);
+  }
+  if (due->len && g_strcmp0 (self->current_tool, "reminders") == 0)
+    courier_reminders_page_refresh (self->reminders_page);
+  return G_SOURCE_CONTINUE;
+}
+
+static gboolean
+check_reminders_once (gpointer data)
+{
+  check_reminders (data);
+  return G_SOURCE_REMOVE;
+}
+
+static void
+snooze_activated (GSimpleAction *a, GVariant *param, gpointer data)
+{
+  CourierWindow *self = data;
+  courier_store_snooze_reminder (self->store, g_variant_get_int64 (param), courier_unix_now () + 10 * 60);
+  toast (self, "Snoozed for 10 minutes");
+  if (g_strcmp0 (self->current_tool, "reminders") == 0)
+    courier_reminders_page_refresh (self->reminders_page);
+}
+
+/* ====================================================================== */
+/*  Local network chat                                                    */
+/* ====================================================================== */
+
+static void
+on_chat_unread (int unread, gpointer data)
+{
+  CourierWindow *self = data;
+  self->chat_unread = unread;
+  for (GtkWidget *row = gtk_widget_get_first_child (self->sidebar); row; row = gtk_widget_get_next_sibling (row))
+    if (g_strcmp0 (g_object_get_data (G_OBJECT (row), "tool"), "chat") == 0) {
+      GtkWidget *badge = g_object_get_data (G_OBJECT (row), "badge");
+      g_autofree char *n = g_strdup_printf ("%d", unread);
+      gtk_label_set_text (GTK_LABEL (badge), n);
+      gtk_widget_set_visible (badge, unread > 0);
+    }
+}
+
+static char *
+start_lan (CourierWindow *self)
+{
+  g_autofree char *id = courier_store_get_setting (self->store, "lan-id");
+  if (!id) {
+    id = g_uuid_string_random ();
+    courier_store_set_setting (self->store, "lan-id", id);
+  }
+  const char *name = self->accounts->len ? ((CourierAccount *) g_ptr_array_index (self->accounts, 0))->name : NULL;
+  if (!name || !*name)
+    name = g_get_real_name ();
+  if (!name || !*name || g_str_equal (name, "Unknown"))
+    name = g_get_user_name ();
+  self->lan = courier_lan_new (id, name);
+
+  /* COURIER_LAN_PORT lets two copies run on one computer (for testing) */
+  const char *port = g_getenv ("COURIER_LAN_PORT");
+  if (port)
+    courier_lan_set_ports (self->lan, COURIER_LAN_DISCOVERY_PORT, (guint16) atoi (port));
+
+  g_autoptr (GError) error = NULL;
+  if (!courier_lan_start (self->lan, &error))
+    return g_strdup_printf ("Local chat is off: %s", error->message);
+  return NULL;
+}
+
+/* ====================================================================== */
 /*  Actions                                                               */
 /* ====================================================================== */
 
@@ -625,9 +1078,21 @@ update_actions (CourierWindow *self)
 }
 
 static void
-on_composer_sent (CourierComposer *composer, CourierWindow *self)
+on_composer_sent (CourierComposer *composer, GBytes *message, CourierWindow *self)
 {
   toast (self, "Message sent");
+
+  /* save what was sent: details in the mail log, the full message as .eml */
+  const CourierAccount *account = courier_backend_get_account (courier_composer_get_backend (composer));
+  g_autofree char *data_dir = courier_store_data_dir ();
+  g_autofree char *eml_dir = g_build_filename (data_dir, "sent-mail", NULL);
+  g_autoptr (GError) error = NULL;
+  CourierMailLogEntry *entry = courier_mail_log_from_sent (message, account->email, eml_dir, &error);
+  if (!entry || !courier_store_log_mail (self->store, entry, &error))
+    g_warning ("Could not record sent mail: %s", error ? error->message : "?");
+  courier_mail_log_free (entry);
+  if (g_strcmp0 (self->current_tool, "log") == 0)
+    courier_mail_log_page_refresh (self->log_page);
   CourierFolder *f = current_folder (self);
   if (f && f->role && g_str_equal (f->role, "sent"))
     load_messages (self);
@@ -909,6 +1374,17 @@ remove_account_activated (GSimpleAction *a, GVariant *p, gpointer data)
 }
 
 static void
+skip_welcome_activated (GSimpleAction *a, GVariant *p, gpointer data)
+{
+  CourierWindow *self = data;
+  self->skip_welcome = TRUE;
+  courier_store_set_setting (self->store, "skip-welcome", "1");
+  gtk_stack_set_visible_child_name (GTK_STACK (self->main_stack), "mail");
+  rebuild_sidebar (self);
+  show_tool (self, "calendar");
+}
+
+static void
 try_demo_activated (GSimpleAction *a, GVariant *p, gpointer data)
 {
   CourierWindow *self = data;
@@ -931,6 +1407,8 @@ static const GActionEntry win_actions[] = {
   { "edit-account",   edit_account_activated },
   { "remove-account", remove_account_activated },
   { "try-demo",       try_demo_activated },
+  { "skip-welcome",   skip_welcome_activated },
+  { "snooze-reminder", snooze_activated, "x" },
 };
 
 /* ====================================================================== */
@@ -958,7 +1436,8 @@ reload_accounts (CourierWindow *self)
     }
   }
 
-  gtk_stack_set_visible_child_name (GTK_STACK (self->main_stack), self->ctxs->len ? "mail" : "welcome");
+  gtk_stack_set_visible_child_name (GTK_STACK (self->main_stack),
+                                    self->ctxs->len || self->skip_welcome ? "mail" : "welcome");
   gtk_stack_set_visible_child_name (GTK_STACK (self->list_stack), "loading");
   adw_navigation_page_set_title (ADW_NAVIGATION_PAGE (self->list_page), "Mail");
   adw_window_title_set_title (ADW_WINDOW_TITLE (self->list_title), "Mail");
@@ -1159,8 +1638,12 @@ build_welcome (CourierWindow *self)
   GtkWidget *demo = gtk_button_new_with_mnemonic ("_Try the Demo");
   gtk_actionable_set_action_name (GTK_ACTIONABLE (demo), "win.try-demo");
   gtk_widget_add_css_class (demo, "pill");
+  GtkWidget *skip = gtk_button_new_with_mnemonic ("Use Calendar, Tasks & _Chat Without Email");
+  gtk_actionable_set_action_name (GTK_ACTIONABLE (skip), "win.skip-welcome");
+  gtk_widget_add_css_class (skip, "flat");
   gtk_box_append (GTK_BOX (box), add);
   gtk_box_append (GTK_BOX (box), demo);
+  gtk_box_append (GTK_BOX (box), skip);
   adw_status_page_set_child (ADW_STATUS_PAGE (status), box);
 
   adw_toolbar_view_set_content (ADW_TOOLBAR_VIEW (toolbar), status);
@@ -1172,6 +1655,9 @@ courier_window_dispose (GObject *object)
 {
   CourierWindow *self = COURIER_WINDOW (object);
   g_clear_handle_id (&self->refresh_source, g_source_remove);
+  g_clear_handle_id (&self->reminder_source, g_source_remove);
+  if (self->lan)
+    courier_lan_stop (self->lan);
   g_cancellable_cancel (self->list_cancellable);
   g_cancellable_cancel (self->fetch_cancellable);
   G_OBJECT_CLASS (courier_window_parent_class)->dispose (object);
@@ -1189,6 +1675,9 @@ courier_window_finalize (GObject *object)
   g_clear_object (&self->list_cancellable);
   g_clear_object (&self->fetch_cancellable);
   g_free (self->current_folder);
+  g_free (self->current_tool);
+  g_clear_object (&self->lan);
+  courier_store_close (self->store);
   G_OBJECT_CLASS (courier_window_parent_class)->finalize (object);
 }
 
@@ -1204,6 +1693,16 @@ courier_window_init (CourierWindow *self)
 {
   self->ctxs = g_ptr_array_new_with_free_func ((GDestroyNotify) account_ctx_free);
   self->messages = g_list_store_new (COURIER_TYPE_MESSAGE);
+  self->accounts = courier_accounts_load ();
+
+  g_autoptr (GError) store_error = NULL;
+  self->store = courier_store_open (NULL, &store_error);
+  if (!self->store) {
+    g_warning ("%s — calendar, tasks and logs will not be saved this session", store_error->message);
+    self->store = courier_store_open (":memory:", NULL);
+  }
+  g_autofree char *skip = courier_store_get_setting (self->store, "skip-welcome");
+  self->skip_welcome = g_strcmp0 (skip, "1") == 0;
 
   gtk_window_set_title (GTK_WINDOW (self), "Courier");
   gtk_window_set_default_size (GTK_WINDOW (self), 1180, 760);
@@ -1223,8 +1722,27 @@ courier_window_init (CourierWindow *self)
   self->outer_split = adw_navigation_split_view_new ();
   adw_navigation_split_view_set_sidebar (ADW_NAVIGATION_SPLIT_VIEW (self->outer_split),
                                          ADW_NAVIGATION_PAGE (build_sidebar_page (self)));
+  /* the content area shows the mail panes or one of the organizer pages */
+  g_autofree char *lan_error = start_lan (self);
+  self->calendar_page = courier_calendar_page_new (self->store);
+  self->tasks_page = courier_tasks_page_new (self->store);
+  self->reminders_page = courier_reminders_page_new (self->store);
+  self->chat_page = courier_chat_page_new (self->store, self->lan, lan_error);
+  courier_chat_page_set_unread_func (self->chat_page, on_chat_unread, self);
+  self->log_page = courier_mail_log_page_new (self->store);
+  self->filters_page = courier_filters_page_new (self->store, run_filters_now, self);
+
+  self->content_stack = gtk_stack_new ();
+  gtk_stack_add_named (GTK_STACK (self->content_stack), self->inner_split, "mail");
+  gtk_stack_add_named (GTK_STACK (self->content_stack), self->calendar_page, "calendar");
+  gtk_stack_add_named (GTK_STACK (self->content_stack), self->tasks_page, "tasks");
+  gtk_stack_add_named (GTK_STACK (self->content_stack), self->reminders_page, "reminders");
+  gtk_stack_add_named (GTK_STACK (self->content_stack), self->chat_page, "chat");
+  gtk_stack_add_named (GTK_STACK (self->content_stack), self->log_page, "log");
+  gtk_stack_add_named (GTK_STACK (self->content_stack), self->filters_page, "filters");
+  self->content_page = GTK_WIDGET (adw_navigation_page_new (self->content_stack, "Mail"));
   adw_navigation_split_view_set_content (ADW_NAVIGATION_SPLIT_VIEW (self->outer_split),
-                                         adw_navigation_page_new (self->inner_split, "Mail"));
+                                         ADW_NAVIGATION_PAGE (self->content_page));
   adw_navigation_split_view_set_min_sidebar_width (ADW_NAVIGATION_SPLIT_VIEW (self->outer_split), 200);
   adw_navigation_split_view_set_max_sidebar_width (ADW_NAVIGATION_SPLIT_VIEW (self->outer_split), 260);
 
@@ -1251,10 +1769,13 @@ courier_window_init (CourierWindow *self)
                               G_OBJECT (self->inner_split), "collapsed", TRUE,
                               G_OBJECT (self->reply_all_button), "visible", FALSE,
                               G_OBJECT (self->read_button), "visible", FALSE,
+                              G_OBJECT (courier_chat_page_get_split (self->chat_page)), "collapsed", TRUE,
                               NULL);
   adw_application_window_add_breakpoint (ADW_APPLICATION_WINDOW (self), bp);
 
   self->refresh_source = g_timeout_add_seconds (AUTO_REFRESH_SECONDS, auto_refresh, self);
+  self->reminder_source = g_timeout_add_seconds (REMINDER_CHECK_SECONDS, check_reminders, self);
+  g_idle_add_full (G_PRIORITY_LOW, check_reminders_once, g_object_ref (self), g_object_unref);
 }
 
 CourierWindow *
@@ -1262,7 +1783,8 @@ courier_window_new (AdwApplication *app, gboolean demo)
 {
   CourierWindow *self = g_object_new (COURIER_TYPE_WINDOW, "application", app, NULL);
   self->demo = demo;
-  self->accounts = courier_accounts_load ();
+  if (demo) /* the demo mailbox is new every time: record it from scratch */
+    courier_store_set_last_uid (self->store, "demo", "INBOX", 0);
   reload_accounts (self);
   return self;
 }

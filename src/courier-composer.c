@@ -32,6 +32,7 @@ struct _CourierComposer {
   gboolean        dirty;
   gboolean        sending;
   gboolean        force_close;
+  GBytes         *outgoing;    /* the message being sent */
 };
 
 G_DEFINE_FINAL_TYPE (CourierComposer, courier_composer, ADW_TYPE_WINDOW)
@@ -293,7 +294,7 @@ on_sent (GObject *source, GAsyncResult *res, gpointer data)
     show_error (self, "Message Not Sent", error->message);
     return;
   }
-  g_signal_emit (self, signals[SIGNAL_SENT], 0);
+  g_signal_emit (self, signals[SIGNAL_SENT], 0, self->outgoing);
   self->force_close = TRUE;
   gtk_window_close (GTK_WINDOW (self));
 }
@@ -311,6 +312,8 @@ send_message (CourierComposer *self)
     return;
   }
   g_ptr_array_add (rcpts, NULL);
+  g_clear_pointer (&self->outgoing, g_bytes_unref);
+  self->outgoing = g_bytes_ref (message);
   set_sending (self, TRUE);
   courier_backend_send (self->backend, message, courier_backend_get_account (self->backend)->email,
                         (const char * const *) rcpts->pdata, on_sent, g_object_ref (self));
@@ -371,6 +374,7 @@ courier_composer_finalize (GObject *object)
 {
   CourierComposer *self = COURIER_COMPOSER (object);
   g_clear_object (&self->backend);
+  g_clear_pointer (&self->outgoing, g_bytes_unref);
   g_ptr_array_unref (self->attachments);
   g_free (self->in_reply_to);
   g_free (self->references);
@@ -384,8 +388,9 @@ courier_composer_class_init (CourierComposerClass *klass)
   G_OBJECT_CLASS (klass)->finalize = courier_composer_finalize;
   GTK_WINDOW_CLASS (klass)->close_request = courier_composer_close_request;
 
+  /* "sent" (GBytes *message): the complete message as it was handed to the server */
   signals[SIGNAL_SENT] = g_signal_new ("sent", G_TYPE_FROM_CLASS (klass), G_SIGNAL_RUN_LAST,
-                                       0, NULL, NULL, NULL, G_TYPE_NONE, 0);
+                                       0, NULL, NULL, NULL, G_TYPE_NONE, 1, G_TYPE_BYTES);
 
   gtk_widget_class_install_action (wc, "composer.send", NULL, send_action);
   gtk_widget_class_add_binding_action (wc, GDK_KEY_Escape, 0, "window.close", NULL);
@@ -601,6 +606,12 @@ prefill (CourierComposer *self, CourierComposeMode mode, const CourierMessageDet
   adw_window_title_set_subtitle (ADW_WINDOW_TITLE (self->title), from);
   gtk_window_set_title (GTK_WINDOW (self), title);
   self->dirty = FALSE; /* prefilled content is not "user work" yet */
+}
+
+CourierBackend *
+courier_composer_get_backend (CourierComposer *self)
+{
+  return self->backend;
 }
 
 CourierComposer *

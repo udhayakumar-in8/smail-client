@@ -30,7 +30,21 @@ static const char *app_css =
   ".composer-field { padding: 4px 12px; min-height: 38px; }"
   ".composer-attachments { padding: 6px 12px; }"
   ".attachment-chip { padding: 2px 4px 2px 10px; border-radius: 8px; background: alpha(currentColor, 0.08); }"
-  ".composer-body { font-size: 1.05em; }";
+  ".composer-body { font-size: 1.05em; }"
+  /* organizer pages */
+  ".page-column { margin: 18px 12px 24px 12px; }"
+  ".section-label { margin-top: 12px; }"
+  ".list-placeholder { padding: 18px; }"
+  "row.task-done .title { text-decoration: line-through; opacity: 0.6; }"
+  "row.overdue .subtitle { color: @error_color; opacity: 1; }"
+  "calendar.card { padding: 6px; }"
+  /* local chat */
+  ".chat-me { margin: 6px 12px; }"
+  ".chat-messages { background: transparent; padding: 12px; }"
+  ".chat-messages row { background: transparent; padding: 3px 6px; }"
+  ".bubble { padding: 8px 12px; border-radius: 16px; background: alpha(currentColor, 0.08); }"
+  ".bubble.outgoing { background: @accent_bg_color; color: @accent_fg_color; }"
+  ".chat-compose { padding: 6px 12px; }";
 
 static void
 about_activated (GSimpleAction *a, GVariant *p, gpointer app)
@@ -85,7 +99,28 @@ quit_activated (GSimpleAction *a, GVariant *p, gpointer app)
   g_application_quit (G_APPLICATION (app));
 }
 
+/* Notification buttons can only target app actions: forward to the window. */
+static void
+snooze_reminder_activated (GSimpleAction *a, GVariant *p, gpointer app)
+{
+  GtkWindow *win = gtk_application_get_active_window (app);
+  if (!win) {
+    GList *wins = gtk_application_get_windows (app);
+    win = wins ? wins->data : NULL;
+  }
+  if (win)
+    g_action_group_activate_action (G_ACTION_GROUP (win), "snooze-reminder", p);
+}
+
+static void
+present_activated (GSimpleAction *a, GVariant *p, gpointer app)
+{
+  g_application_activate (G_APPLICATION (app));
+}
+
 static const GActionEntry app_actions[] = {
+  { "activate",  present_activated },
+  { "snooze-reminder", snooze_reminder_activated, "x" },
   { "about",     about_activated },
   { "shortcuts", shortcuts_activated },
   { "quit",      quit_activated },
