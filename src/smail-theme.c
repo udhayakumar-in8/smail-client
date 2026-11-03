@@ -6,6 +6,8 @@
  * They work by overriding libadwaita's named colours plus a few widget rules. */
 #include "smail-theme.h"
 
+#include <string.h>
+
 static GtkCssProvider *provider;
 static char *current;
 
@@ -203,6 +205,34 @@ static const char *elementary_rules =
   "switch { border: 1px solid @smail_btn_border; }"
   "switch:checked { background-color: @accent_bg_color; }";
 
+/* libadwaita 1.6 and newer read colours from CSS variables
+ * (--window-bg-color, ...). Derive them from the @define-color palette so
+ * the styles look the same on every libadwaita version. GTK before 4.16
+ * can't parse variables, so this is only added when they're used. */
+static char *
+css_variables (const char *palette)
+{
+  if (adw_get_major_version () == 1 && adw_get_minor_version () < 6)
+    return g_strdup ("");
+
+  GString *out = g_string_new (":root {");
+  g_auto (GStrv) defs = g_strsplit (palette, ";", -1);
+  for (int i = 0; defs[i]; i++) {
+    const char *d = defs[i];
+    if (!g_str_has_prefix (d, "@define-color "))
+      continue;
+    d += strlen ("@define-color ");
+    const char *space = strchr (d, ' ');
+    if (!space || g_str_has_prefix (d, "smail_"))
+      continue;
+    g_autofree char *name = g_strndup (d, space - d);
+    g_strdelimit (name, "_", '-');
+    g_string_append_printf (out, " --%s: %s;", name, space + 1);
+  }
+  g_string_append (out, " }");
+  return g_string_free (out, FALSE);
+}
+
 /* ---------------- apply ---------------- */
 
 gboolean
@@ -249,7 +279,9 @@ smail_theme_apply (const char *name)
 
   gboolean dark = g_str_equal (name, SMAIL_THEME_MATTE_BLACK);
   adw_style_manager_set_color_scheme (sm, dark ? ADW_COLOR_SCHEME_FORCE_DARK : ADW_COLOR_SCHEME_FORCE_LIGHT);
-  g_autofree char *css = g_strconcat (dark ? matte_black : matte_white, elementary_rules, NULL);
+  const char *palette = dark ? matte_black : matte_white;
+  g_autofree char *vars = css_variables (palette);
+  g_autofree char *css = g_strconcat (palette, vars, elementary_rules, NULL);
   gtk_css_provider_load_from_string (provider, css);
   g_object_set (settings, "gtk-font-name", "Inter 10", NULL);
 }

@@ -61,6 +61,7 @@ about_activated (GSimpleAction *a, GVariant *p, gpointer app)
   adw_dialog_present (about, GTK_WIDGET (gtk_application_get_active_window (app)));
 }
 
+#if !ADW_CHECK_VERSION (1, 8, 0)
 static const char *shortcuts_ui =
   "<interface><object class='GtkShortcutsWindow' id='w'><property name='modal'>1</property>"
   "<child><object class='GtkShortcutsSection'><property name='section-name'>main</property>"
@@ -83,7 +84,42 @@ static const char *shortcuts_ui =
   "<child><object class='GtkShortcutsShortcut'><property name='title'>Keyboard Shortcuts</property><property name='accelerator'>&lt;Control&gt;question</property></object></child>"
   "<child><object class='GtkShortcutsShortcut'><property name='title'>Quit</property><property name='accelerator'>&lt;Control&gt;q</property></object></child>"
   "</object></child></object></child></object></interface>";
+#endif
 
+#if ADW_CHECK_VERSION (1, 8, 0)
+/* libadwaita 1.8+: GtkShortcutsWindow is deprecated, use AdwShortcutsDialog */
+static void
+shortcuts_activated (GSimpleAction *a, GVariant *p, gpointer app)
+{
+  static const struct { const char *section, *title, *accel; } items[] = {
+    { "Messages", "Compose", "<Control>n" },
+    { "Messages", "Reply", "<Control>r" },
+    { "Messages", "Reply All", "<Control><Shift>r" },
+    { "Messages", "Forward", "<Control>l" },
+    { "Messages", "Send (in composer)", "<Control>Return" },
+    { "Organize", "Archive", "a" },
+    { "Organize", "Move to Trash", "Delete" },
+    { "Organize", "Star / Unstar", "s" },
+    { "Organize", "Mark Read / Unread", "u" },
+    { "General", "Search", "<Control>f" },
+    { "General", "Refresh", "F5" },
+    { "General", "Keyboard Shortcuts", "<Control>question" },
+    { "General", "Quit", "<Control>q" },
+  };
+  AdwDialog *dialog = adw_shortcuts_dialog_new ();
+  AdwShortcutsSection *section = NULL;
+  const char *current = NULL;
+  for (gsize i = 0; i < G_N_ELEMENTS (items); i++) {
+    if (g_strcmp0 (current, items[i].section) != 0) {
+      current = items[i].section;
+      section = adw_shortcuts_section_new (current);
+      adw_shortcuts_dialog_add (ADW_SHORTCUTS_DIALOG (dialog), section);
+    }
+    adw_shortcuts_section_add (section, adw_shortcuts_item_new (items[i].title, items[i].accel));
+  }
+  adw_dialog_present (dialog, GTK_WIDGET (gtk_application_get_active_window (app)));
+}
+#else
 static void
 shortcuts_activated (GSimpleAction *a, GVariant *p, gpointer app)
 {
@@ -92,6 +128,7 @@ shortcuts_activated (GSimpleAction *a, GVariant *p, gpointer app)
   gtk_window_set_transient_for (win, gtk_application_get_active_window (app));
   gtk_window_present (win);
 }
+#endif
 
 static void
 quit_activated (GSimpleAction *a, GVariant *p, gpointer app)

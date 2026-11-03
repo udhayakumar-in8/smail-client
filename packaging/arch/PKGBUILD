@@ -1,0 +1,48 @@
+# Maintainer: Udhayakumar <udhayazm1@gmail.com>
+#
+# Build and install on Arch Linux:
+#   makepkg -si
+# The release workflow publishes a copy of this file with pkgver and the
+# tarball checksum filled in, next to a ready-made smail-*.pkg.tar.zst.
+
+pkgname=smail
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Email client with calendar, tasks, reminders and local network chat, in the style of elementary OS Mail"
+arch=('x86_64' 'aarch64')
+url="https://github.com/udhayakumar-in8/smail-client"
+license=('GPL-3.0-or-later')
+depends=(
+  'glib2'
+  'glib-networking'
+  'gtk4'
+  'libadwaita'
+  'webkitgtk-6.0'
+  'gmime3'
+  'libsecret'
+  'curl'
+  'sqlite'
+  'json-glib'
+)
+makedepends=('meson')
+optdepends=(
+  'gnome-keyring: remember account passwords'
+  'inter-font: the typeface used by the Matte White and Matte Black styles'
+)
+source=("smail-client-$pkgver.tar.xz::$url/releases/download/v$pkgver/smail-client-$pkgver.tar.xz")
+sha256sums=('SKIP')
+
+build() {
+  arch-meson "smail-client-$pkgver" build
+  meson compile -C build
+}
+
+check() {
+  meson test -C build --print-errorlogs
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+  install -Dm644 "smail-client-$pkgver/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 "smail-client-$pkgver/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -14,8 +14,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-and-test:
-    name: Build & test (Ubuntu 24.04)
+  ubuntu:
+    name: Ubuntu 24.04
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -27,7 +27,8 @@ jobs:
             build-essential meson pkg-config dpkg-dev \
             libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev libgmime-3.0-dev \
             libsecret-1-dev libcurl4-openssl-dev libsqlite3-dev libjson-glib-dev \
-            glib-networking dovecot-imapd desktop-file-utils
+            glib-networking dovecot-imapd desktop-file-utils \
+            xvfb xauth imagemagick dbus fonts-inter
 
       - name: Configure
         run: meson setup build -Dwerror=true
@@ -46,6 +47,9 @@ jobs:
           ./build/test-imap --tap | tee test-imap.log
           ! grep -q "# SKIP" test-imap.log
 
+      - name: GUI smoke test (System, Matte White, Matte Black)
+        run: tests/smoke-gui.sh build/smail smoke
+
       - name: Validate desktop file
         run: desktop-file-validate data/*.desktop
 
@@ -58,3 +62,77 @@ jobs:
           name: smail-deb-${{ github.sha }}
           path: dist/*.deb
           if-no-files-found: error
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-ubuntu-${{ github.sha }}
+          path: smoke/
+          if-no-files-found: ignore
+
+  arch:
+    name: Arch Linux
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    steps:
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel git meson \
+            gtk4 libadwaita webkitgtk-6.0 gmime3 libsecret curl sqlite json-glib glib-networking \
+            desktop-file-utils xorg-server-xvfb xorg-xauth imagemagick dbus python inter-font
+
+      - uses: actions/checkout@v5
+
+      - name: Show library versions
+        run: pkg-config --modversion gtk4 libadwaita-1 webkitgtk-6.0 gmime-3.0 glib-2.0
+
+      - name: Configure
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          meson setup build -Dwerror=true
+
+      - name: Build
+        run: meson compile -C build
+
+      - name: Unit tests
+        run: meson test -C build --print-errorlogs
+
+      - name: GUI smoke test (System, Matte White, Matte Black)
+        run: tests/smoke-gui.sh build/smail smoke
+
+      - name: Validate desktop file
+        run: desktop-file-validate data/*.desktop
+
+      - name: Build Arch package with makepkg
+        run: |
+          meson dist -C build --formats xztar --no-tests
+          useradd -m builder
+          chown -R builder "$GITHUB_WORKSPACE"
+          su builder -c "packaging/arch/build-pkg.sh build/meson-dist/smail-client-*.tar.xz dist"
+
+      - name: Install the package and run it
+        run: |
+          pacman -U --noconfirm dist/smail-*.pkg.tar.zst
+          pacman -Qi smail
+          smail --help-all | grep -- --demo
+          test -f /usr/share/applications/io.github.udhayakumar_in8.SMail.desktop
+          test -f /usr/share/licenses/smail/LICENSE
+
+      - name: Upload Arch package
+        uses: actions/upload-artifact@v4
+        with:
+          name: smail-arch-${{ github.sha }}
+          path: |
+            dist/smail-*.pkg.tar.zst
+            dist/PKGBUILD
+          if-no-files-found: error
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-arch-${{ github.sha }}
+          path: smoke/
+          if-no-files-found: ignore
