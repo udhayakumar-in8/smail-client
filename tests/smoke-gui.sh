@@ -32,6 +32,20 @@ PY
       kill $pid; wait $pid 2>/dev/null; exit 0' "$BIN" "$OUT/$theme.png" > "$OUT/$theme.log" 2>&1
   status=$?
 
+  # does the style really apply? check window brightness and the
+  # blue-tinted selection the Matte styles give the selected Inbox row
+  look=""
+  if [ -f "$OUT/$theme.png" ] && command -v convert >/dev/null; then
+    mean="$(convert "$OUT/$theme.png" -crop 1170x750+5+5 -colorspace Gray -format '%[fx:int(100*mean)]' info:)"
+    tint="$(convert "$OUT/$theme.png" -format '%[fx:int(255*(p{180,103}.b-p{180,103}.r))]' info:)"
+    look="brightness ${mean}%, selection blue tint ${tint}"
+    case "$theme" in
+      matte-white) [ "$mean" -ge 85 ] && [ "$tint" -ge 15 ] || look="$look  <- expected light with a blue selection" ;;
+      matte-black) [ "$mean" -le 25 ] && [ "$tint" -ge 15 ] || look="$look  <- expected dark with a blue selection" ;;
+    esac
+    case "$look" in *expected*) echo "SMAIL-SMOKE: $theme $look" >> "$OUT/$theme.log" ;; esac
+  fi
+
   problems="$(grep -E 'CRITICAL|Theme parser|Gtk-WARNING|Adwaita-WARNING|SMail-WARNING|SMAIL-SMOKE|Segmentation|Aborted' "$OUT/$theme.log" \
               | grep -vE 'a11y|accessibility|org\.freedesktop\.(Notifications|portal)|xdg-desktop-portal|DRI3' || true)"
   if [ $status -ne 0 ] || [ -n "$problems" ]; then
@@ -39,7 +53,7 @@ PY
     echo "$problems"
     fail=1
   else
-    echo "✓ $theme ($(du -h "$OUT/$theme.png" 2>/dev/null | cut -f1) screenshot)"
+    echo "✓ $theme ($look)"
   fi
   rm -rf "$profile"
 done

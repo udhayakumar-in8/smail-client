@@ -6,7 +6,7 @@
 # tarball checksum filled in, next to a ready-made smail-*.pkg.tar.zst.
 
 pkgname=smail
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="Email client with calendar, tasks, reminders and local network chat, in the style of elementary OS Mail"
 arch=('x86_64' 'aarch64')

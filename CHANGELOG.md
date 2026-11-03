@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.1
+
+### Arch Linux support
+- Arch Linux package (`.pkg.tar.zst`) and `PKGBUILD` with every release
+- Builds cleanly with GTK 4.24 and libadwaita 1.10: the calendar uses `gtk_calendar_set_date`
+  on GTK 4.20+, and the keyboard shortcuts open in the new `AdwShortcutsDialog` on
+  libadwaita 1.8+
+- The Matte White and Matte Black styles also set the CSS variables that libadwaita 1.6+
+  uses, so they look the same on Arch as on Ubuntu
+
+### Testing
+- CI builds, tests and packages SMail on both Ubuntu 24.04 and Arch Linux
+- A GUI smoke test starts the app in every style on a virtual display, fails on any GTK or
+  libadwaita warning, and checks from a screenshot that each style is applied
+- The `.deb` file name no longer contains `~`, so it matches `SHA256SUMS`
+
 ## 0.1.0
 
 The first release of SMail.

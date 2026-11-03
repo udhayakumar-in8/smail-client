@@ -47,8 +47,8 @@ jobs:
             echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
 
-  release:
-    name: Build & publish release
+  ubuntu:
+    name: Ubuntu build, tarball and .deb
     needs: check
     if: needs.check.outputs.publish == 'true'
     runs-on: ubuntu-24.04
@@ -61,10 +61,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential meson pkg-config dpkg-dev jq \
+            build-essential meson pkg-config dpkg-dev \
             libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev libgmime-3.0-dev \
             libsecret-1-dev libcurl4-openssl-dev libsqlite3-dev libjson-glib-dev \
-            glib-networking dovecot-imapd
+            glib-networking dovecot-imapd xvfb xauth imagemagick dbus fonts-inter
 
       - name: Build and test
         run: |
@@ -76,6 +76,7 @@ jobs:
           test -n "$SMAIL_TEST_IMAP" && test -n "$SMAIL_TEST_SMTP"
           ./build/test-imap --tap | tee test-imap.log
           ! grep -q "# SKIP" test-imap.log
+          tests/smoke-gui.sh build/smail smoke
 
       - name: Source tarball
         run: |
@@ -86,8 +87,68 @@ jobs:
       - name: Ubuntu 24.04 package
         run: packaging/build-deb.sh dist
 
-      - name: Checksums
-        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ubuntu-dist
+          path: dist/
+          if-no-files-found: error
+
+  arch:
+    name: Arch Linux package
+    needs: [check, ubuntu]
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    steps:
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel git meson \
+            gtk4 libadwaita webkitgtk-6.0 gmime3 libsecret curl sqlite json-glib glib-networking \
+            xorg-server-xvfb xorg-xauth imagemagick dbus python inter-font
+
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ubuntu-dist
+          path: ubuntu-dist
+
+      - name: Build with makepkg from the release tarball
+        run: |
+          useradd -m builder
+          chown -R builder "$GITHUB_WORKSPACE"
+          su builder -c "packaging/arch/build-pkg.sh ubuntu-dist/smail-client-${{ needs.check.outputs.version }}.tar.xz dist"
+
+      - name: Install it and smoke-test the installed app
+        run: |
+          pacman -U --noconfirm dist/smail-*.pkg.tar.zst
+          pacman -Qi smail
+          tests/smoke-gui.sh /usr/bin/smail smoke
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch-dist
+          path: |
+            dist/smail-*.pkg.tar.zst
+            dist/PKGBUILD
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [check, ubuntu, arch]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect files and checksums
+        run: |
+          mkdir -p dist
+          cp artifacts/ubuntu-dist/* artifacts/arch-dist/* dist/
+          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
 
       - name: Release notes
         run: |
@@ -101,6 +162,14 @@ jobs:
           cat >> notes.md <<'NOTES'
 
           ### Install
+
+          **Arch Linux:** download the `.pkg.tar.zst` below, then run
+
+          ```bash
+          sudo pacman -U smail-*.pkg.tar.zst
+          ```
+
+          Or build it yourself: download `PKGBUILD` into an empty folder and run `makepkg -si`.
 
           **Ubuntu 24.04 or newer:** download the `.deb` below, then run
 

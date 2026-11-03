@@ -114,8 +114,21 @@ is logged, filtered and announced with a notification.
 
 ## Installing
 
-**Ubuntu 24.04 or newer:** download the `.deb` from the
-[latest release](https://github.com/udhayakumar-in8/smail-client/releases/latest), then:
+Download from the [latest release](https://github.com/udhayakumar-in8/smail-client/releases/latest).
+
+**Arch Linux:** install the ready-made package:
+
+```bash
+sudo pacman -U smail-*.pkg.tar.zst
+```
+
+Or build it yourself with the release's `PKGBUILD`. Put it in an empty folder, then:
+
+```bash
+makepkg -si
+```
+
+**Ubuntu 24.04 or newer:**
 
 ```bash
 sudo apt install ./smail_*.deb
@@ -228,14 +241,21 @@ SMAIL_TEST_IMAP=127.0.0.1:143 SMAIL_TEST_USER=test SMAIL_TEST_PASS=secret SMAIL_
 
 ## Releases
 
-The [CI workflow](.github/workflows/ci.yml) builds and tests every push and pull request. It also
-runs the IMAP/SMTP tests against a temporary Dovecot server and uploads a `.deb` as a build artifact.
+The [CI workflow](.github/workflows/ci.yml) builds and tests every push and pull request on
+**Ubuntu 24.04** and **Arch Linux** (in the official `archlinux` container), with warnings treated
+as errors. On each distro it:
+
+- runs the unit tests, and on Ubuntu the IMAP/SMTP tests against a temporary Dovecot server;
+- runs `tests/smoke-gui.sh`, which starts the app in every style on a virtual display, fails on
+  GTK/libadwaita warnings, and checks the screenshot to confirm the style applied;
+- builds the `.deb` and the Arch package (`makepkg`), installs the Arch package with `pacman`, and
+  uploads both packages as build artifacts.
 
 To publish a release, change the version in `meson.build`, add a section for it to
 `CHANGELOG.md`, and push to `main`. The [release workflow](.github/workflows/release.yml) sees
 the version has no release yet. It then builds and tests everything again, creates the
-`v<version>` tag, and publishes a GitHub release with the source tarball, the Ubuntu 24.04 `.deb`,
-`SHA256SUMS` and the changelog notes. Pushing a matching `v<version>` tag yourself works too.
+`v<version>` tag, and publishes a GitHub release with the source tarball, the Arch Linux package
+and its `PKGBUILD`, the Ubuntu 24.04 `.deb`, `SHA256SUMS` and the changelog notes. Pushing a matching `v<version>` tag yourself works too.
 
 ## Not yet implemented
 
