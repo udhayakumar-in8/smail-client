@@ -193,7 +193,7 @@ void
 smail_date_time_set_unix (SMailDateTime *self, gint64 t)
 {
   g_autoptr (GDateTime) dt = g_date_time_new_from_unix_local (t);
-  gtk_calendar_select_day (GTK_CALENDAR (self->calendar), dt);
+  smail_calendar_set_date (GTK_CALENDAR (self->calendar), dt);
   gtk_spin_button_set_value (GTK_SPIN_BUTTON (self->hour), g_date_time_get_hour (dt));
   gtk_spin_button_set_value (GTK_SPIN_BUTTON (self->minute), g_date_time_get_minute (dt));
   update_date_label (self);

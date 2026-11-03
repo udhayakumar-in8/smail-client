@@ -360,7 +360,7 @@ on_today (GtkButton *b, GtkWidget *page)
 {
   CalendarPage *p = g_object_get_data (G_OBJECT (page), "calendar-page");
   g_autoptr (GDateTime) now = g_date_time_new_now_local ();
-  gtk_calendar_select_day (GTK_CALENDAR (p->calendar), now);
+  smail_calendar_set_date (GTK_CALENDAR (p->calendar), now);
   smail_calendar_page_refresh (page);
 }
 

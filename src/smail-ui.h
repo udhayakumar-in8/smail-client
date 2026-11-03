@@ -30,6 +30,17 @@ GtkWidget *smail_date_time_new      (gint64 unix_time);
 gint64     smail_date_time_get_unix (SMailDateTime *self);
 void       smail_date_time_set_unix (SMailDateTime *self, gint64 unix_time);
 
+/* gtk_calendar_select_day() is deprecated since GTK 4.20 */
+static inline void
+smail_calendar_set_date (GtkCalendar *calendar, GDateTime *date)
+{
+#if GTK_CHECK_VERSION (4, 20, 0)
+  gtk_calendar_set_date (calendar, date);
+#else
+  gtk_calendar_select_day (calendar, date);
+#endif
+}
+
 /* Round up to the next quarter hour, as a sensible default start time. */
 gint64     smail_next_quarter_hour  (gint64 unix_time);
 
