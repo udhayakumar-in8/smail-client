@@ -49,6 +49,8 @@ Description: email client with calendar, tasks and local chat
 CONTROL
 
 mkdir -p "$OUT"
-DEB="$OUT/smail_${VERSION}-1~${DIST}_${ARCH}.deb"
+# "~" is right in the version field but GitHub renames it in release
+# downloads, so keep it out of the file name (and so out of SHA256SUMS)
+DEB="$OUT/smail_${VERSION}-1.${DIST}_${ARCH}.deb"
 dpkg-deb --root-owner-group --build "$PKG" "$DEB" >/dev/null
 echo "$DEB"
