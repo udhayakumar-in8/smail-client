@@ -1,2 +1,5 @@
 build/
 *.o
+live.env
+test-imap.log
+dist/
