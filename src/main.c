@@ -2,9 +2,9 @@
 #include <adwaita.h>
 #include <gmime/gmime.h>
 
-#include "courier-window.h"
+#include "smail-window.h"
 
-#define APP_ID "dev.courier.Mail"
+#define APP_ID "io.github.udhayakumar_in8.SMail"
 
 static gboolean opt_demo = FALSE;
 
@@ -49,9 +49,9 @@ static const char *app_css =
 static void
 about_activated (GSimpleAction *a, GVariant *p, gpointer app)
 {
-  const char *developers[] = { "Courier contributors", NULL };
+  const char *developers[] = { "SMail contributors", NULL };
   AdwDialog *about = adw_about_dialog_new ();
-  adw_about_dialog_set_application_name (ADW_ABOUT_DIALOG (about), "Courier");
+  adw_about_dialog_set_application_name (ADW_ABOUT_DIALOG (about), "SMail");
   adw_about_dialog_set_application_icon (ADW_ABOUT_DIALOG (about), "mail-send-symbolic");
   adw_about_dialog_set_version (ADW_ABOUT_DIALOG (about), PACKAGE_VERSION);
   adw_about_dialog_set_comments (ADW_ABOUT_DIALOG (about),
@@ -161,7 +161,7 @@ on_activate (GApplication *app)
 {
   GtkWindow *win = gtk_application_get_active_window (GTK_APPLICATION (app));
   if (!win)
-    win = GTK_WINDOW (courier_window_new (ADW_APPLICATION (app), opt_demo));
+    win = GTK_WINDOW (smail_window_new (ADW_APPLICATION (app), opt_demo));
   gtk_window_present (win);
 }
 
@@ -175,7 +175,7 @@ int
 main (int argc, char *argv[])
 {
   g_autoptr (AdwApplication) app = adw_application_new (APP_ID, G_APPLICATION_DEFAULT_FLAGS);
-  g_set_application_name ("Courier");
+  g_set_application_name ("SMail");
 
   GOptionEntry options[] = {
     { "demo", 0, 0, G_OPTION_ARG_NONE, &opt_demo, "Explore the app with sample messages", NULL },

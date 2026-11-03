@@ -1,4 +1,4 @@
-# Courier
+# SMail
 
 A native email client for Linux written in **C** with **GTK 4** and **libadwaita**, modelled on the
 three-pane layout of elementary OS Mail.
@@ -37,7 +37,7 @@ three-pane layout of elementary OS Mail.
 ## Organizer and local features
 
 Everything below is stored on your computer in a SQLite database
-(`~/.local/share/courier/courier.db`). None of it is sent to your mail server.
+(`~/.local/share/smail/smail.db`). None of it is sent to your mail server.
 
 | Calendar | Tasks |
 |---|---|
@@ -50,22 +50,22 @@ Everything below is stored on your computer in a SQLite database
 - **Tasks**: quick-add to-dos, due dates, an optional reminder at the due time, and a Completed list.
 - **Reminders**: one-off reminders, plus the ones created by events and tasks. When one is due you
   get a desktop notification and an in-app banner with **Snooze 10 minutes**. Reminders only fire
-  while Courier is running.
+  while SMail is running.
 - **Filters**: rules such as *If From contains "bank" → move to "Finance"*. Fields are From, To,
   Subject or any of them; conditions are contains, doesn't contain, is, starts with and ends with;
   actions are move to folder, mark as read, star and move to Trash. Rules run automatically on **new
   mail arriving in the Inbox**, top to bottom, and **Run on Inbox** applies them to existing mail.
 - **Mail Log**: details of every message that arrives in your Inbox (sender, recipients,
   subject, date, account, folder) and every message you send are **saved automatically**. Sent
-  messages also keep a full `.eml` copy in `~/.local/share/courier/sent-mail/`. The log can be
+  messages also keep a full `.eml` copy in `~/.local/share/smail/sent-mail/`. The log can be
   searched, filtered by received/sent, and exported to CSV.
-- **Local Chat**: message other people running Courier on the same Wi-Fi/LAN, with no internet or
+- **Local Chat**: message other people running SMail on the same Wi-Fi/LAN, with no internet or
   server needed. Computers find each other automatically (UDP broadcast on port 47820) and messages
   go directly over TCP port 47821. If broadcasts are blocked, add someone with **+** and their IP
   address. Chat history is kept locally. Traffic is **not encrypted**, so use it only on networks
   you trust, and allow those ports in your firewall.
 
-New mail is detected when Courier refreshes: at start-up, every 5 minutes, or when you press F5.
+New mail is detected when SMail refreshes: at start-up, every 5 minutes, or when you press F5.
 The first sync of an account records what is already in the Inbox. After that, each new message
 is logged, filtered and announced with a notification.
 
@@ -96,7 +96,7 @@ meson setup build
 ninja -C build
 ```
 ```bash
-./build/courier            # or: ./build/courier --demo
+./build/smail            # or: ./build/smail --demo
 ```
 
 Install system-wide with `sudo ninja -C build install`.
@@ -122,29 +122,29 @@ These providers need IMAP turned on and, with two-factor authentication enabled,
 ```
 src/
   main.c                    app startup, CSS, About dialog, shortcuts
-  courier-window.c          the three-pane window, actions, account lifecycle
-  courier-message-view.c    reading pane (header, attachments, sandboxed WebKit body)
-  courier-composer.c        compose / reply / forward window, builds MIME with GMime
-  courier-account-dialog.c  add/edit account form with provider autodetection
-  courier-accounts.c        accounts.ini persistence + libsecret passwords
-  courier-backend.c         async API: every operation runs on a worker thread (GTask)
-  courier-imap.c            small IMAP4rev1 client on GIO sockets/TLS (literals, UTF-7)
-  courier-smtp.c            SMTP submission via libcurl
-  courier-demo.c            in-memory sample mailbox for --demo
-  courier-types.c           Account/Folder/Message types and MIME parsing
-  courier-util.c            date formatting, HTML↔text helpers
-  courier-store.c           SQLite: events, tasks, reminders, filters, mail log, chat history
-  courier-automation.c      filter matching and mail log entries
-  courier-lan.c             LAN chat: UDP discovery + JSON-over-TCP messages
-  courier-organizer.c       Calendar, Tasks and Reminders pages
-  courier-mail-tools.c      Filters and Mail Log pages
-  courier-chat-page.c       Local Chat page
-  courier-ui.c              shared widgets (date-time picker, page helpers)
+  smail-window.c          the three-pane window, actions, account lifecycle
+  smail-message-view.c    reading pane (header, attachments, sandboxed WebKit body)
+  smail-composer.c        compose / reply / forward window, builds MIME with GMime
+  smail-account-dialog.c  add/edit account form with provider autodetection
+  smail-accounts.c        accounts.ini persistence + libsecret passwords
+  smail-backend.c         async API: every operation runs on a worker thread (GTask)
+  smail-imap.c            small IMAP4rev1 client on GIO sockets/TLS (literals, UTF-7)
+  smail-smtp.c            SMTP submission via libcurl
+  smail-demo.c            in-memory sample mailbox for --demo
+  smail-types.c           Account/Folder/Message types and MIME parsing
+  smail-util.c            date formatting, HTML↔text helpers
+  smail-store.c           SQLite: events, tasks, reminders, filters, mail log, chat history
+  smail-automation.c      filter matching and mail log entries
+  smail-lan.c             LAN chat: UDP discovery + JSON-over-TCP messages
+  smail-organizer.c       Calendar, Tasks and Reminders pages
+  smail-mail-tools.c      Filters and Mail Log pages
+  smail-chat-page.c       Local Chat page
+  smail-ui.c              shared widgets (date-time picker, page helpers)
 tests/test-imap.c           IMAP/SMTP/MIME tests (offline + live server)
 tests/test-local.c          database, filters, mail log and LAN chat tests
 ```
 
-The UI never blocks. `CourierBackend` serialises access to each account's IMAP connection with
+The UI never blocks. `SMailBackend` serialises access to each account's IMAP connection with
 a mutex, runs the work on a thread, and returns results to the main loop. If you switch folders
 or messages mid-request, the old request is cancelled or its result is discarded.
 
@@ -158,14 +158,14 @@ To try Local Chat with two copies on one computer, give the second copy its own 
 message port:
 
 ```bash
-XDG_DATA_HOME=/tmp/b/data XDG_CONFIG_HOME=/tmp/b/config COURIER_LAN_PORT=47831 ./build/courier --demo
+XDG_DATA_HOME=/tmp/b/data XDG_CONFIG_HOME=/tmp/b/config SMAIL_LAN_PORT=47831 ./build/smail --demo
 ```
 
 To also test against a real IMAP server (it clears and fills INBOX, Archive, Trash and Sent, so **use a
 throwaway test account**) and an SMTP server:
 
 ```bash
-COURIER_TEST_IMAP=127.0.0.1:143 COURIER_TEST_USER=test COURIER_TEST_PASS=secret COURIER_TEST_SMTP=127.0.0.1:25 ./build/test-imap
+SMAIL_TEST_IMAP=127.0.0.1:143 SMAIL_TEST_USER=test SMAIL_TEST_PASS=secret SMAIL_TEST_SMTP=127.0.0.1:25 ./build/test-imap
 ```
 
 ## Not yet implemented
