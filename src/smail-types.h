@@ -97,6 +97,7 @@ typedef struct {
   char      *text;
   GPtrArray *attachments; /* SMailAttachment*, real attachments            */
   GPtrArray *inline_parts;/* SMailAttachment*, cid:-referenced inline parts */
+  GBytes    *raw;         /* the complete message as downloaded */
 } SMailMessageDetail;
 
 SMailMessageDetail *smail_message_detail_parse (const char *uid, GBytes *raw, GError **error);

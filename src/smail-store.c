@@ -1,5 +1,6 @@
 /* smail-store.c — SQLite persistence */
 #include "smail-store.h"
+#include "smail-store-private.h"
 
 #include <gio/gio.h>
 #include <sqlite3.h>
@@ -39,7 +40,9 @@ static const char *schema =
   "CREATE TABLE IF NOT EXISTS lan_messages ("
   "  id INTEGER PRIMARY KEY AUTOINCREMENT, peer_id TEXT NOT NULL, peer_name TEXT, outgoing INTEGER NOT NULL,"
   "  text TEXT NOT NULL, ts INTEGER NOT NULL);"
-  "CREATE INDEX IF NOT EXISTS lan_messages_peer ON lan_messages(peer_id, ts);";
+  "CREATE INDEX IF NOT EXISTS lan_messages_peer ON lan_messages(peer_id, ts);"
+  "CREATE TABLE IF NOT EXISTS messages (account TEXT NOT NULL, folder TEXT NOT NULL, uid TEXT NOT NULL,"
+  "  path TEXT NOT NULL, size INTEGER NOT NULL, saved INTEGER NOT NULL, PRIMARY KEY (account, folder, uid));";
 
 /* ---------------- free / copy ---------------- */
 
@@ -684,4 +687,103 @@ smail_store_list_chat_messages (SMailStore *s, const char *peer_id, int limit)
   }
   sqlite3_finalize (st);
   return out;
+}
+
+/* ---------------- downloaded messages ---------------- */
+
+static char *
+safe_name (const char *s)
+{
+  GString *out = g_string_new (NULL);
+  for (const char *p = s ? s : ""; *p; p++)
+    g_string_append_c (out, g_ascii_isalnum (*p) || strchr ("@._-", *p) ? *p : '_');
+  /* no ".." anywhere, and no hidden/relative names */
+  for (gsize i = 0; i + 1 < out->len; i++)
+    if (out->str[i] == '.' && out->str[i + 1] == '.')
+      out->str[i] = '_';
+  if (out->len == 0 || out->str[0] == '.')
+    g_string_prepend_c (out, '_');
+  return g_string_free (out, FALSE);
+}
+
+char *
+smail_store_mail_dir (void)
+{
+  g_autofree char *dir = smail_store_data_dir ();
+  return g_build_filename (dir, "mail", NULL);
+}
+
+gboolean
+smail_store_save_message (SMailStore *s, const char *account, const char *folder, const char *uid,
+                          GBytes *raw, char **path_out, GError **error)
+{
+  g_autofree char *root = smail_store_mail_dir ();
+  g_autofree char *acc = safe_name (account);
+  g_autofree char *fol = safe_name (folder);
+  g_autofree char *name = g_strdup_printf ("%s.eml", uid);
+  g_autofree char *safe_uid = safe_name (name);
+  g_autofree char *dir = g_build_filename (root, acc, fol, NULL);
+  g_autofree char *path = g_build_filename (dir, safe_uid, NULL);
+  g_mkdir_with_parents (dir, 0700);
+
+  gsize len;
+  const char *data = g_bytes_get_data (raw, &len);
+  if (!g_file_set_contents_full (path, data, len, G_FILE_SET_CONTENTS_CONSISTENT, 0600, error))
+    return FALSE;
+
+  sqlite3_stmt *st = prepare (s, "INSERT INTO messages(account, folder, uid, path, size, saved) VALUES(?,?,?,?,?,?) "
+                                 "ON CONFLICT(account, folder, uid) DO UPDATE SET path = excluded.path,"
+                                 " size = excluded.size, saved = excluded.saved");
+  bind_text (st, 1, account);
+  bind_text (st, 2, folder);
+  bind_text (st, 3, uid);
+  bind_text (st, 4, path);
+  sqlite3_bind_int64 (st, 5, len);
+  sqlite3_bind_int64 (st, 6, g_get_real_time () / G_USEC_PER_SEC);
+  if (!step_done (s, st, error))
+    return FALSE;
+
+  /* point the mail log entry for this message at the saved copy */
+  st = prepare (s, "UPDATE mail_log SET eml_path = ? WHERE direction = 'received' AND account = ? AND folder = ? AND uid = ?");
+  bind_text (st, 1, path);
+  bind_text (st, 2, account);
+  bind_text (st, 3, folder);
+  bind_text (st, 4, uid);
+  step_done (s, st, NULL);
+
+  if (path_out)
+    *path_out = g_steal_pointer (&path);
+  return TRUE;
+}
+
+GBytes *
+smail_store_load_message (SMailStore *s, const char *account, const char *folder, const char *uid)
+{
+  sqlite3_stmt *st = prepare (s, "SELECT path FROM messages WHERE account = ? AND folder = ? AND uid = ?");
+  bind_text (st, 1, account);
+  bind_text (st, 2, folder);
+  bind_text (st, 3, uid);
+  g_autofree char *path = sqlite3_step (st) == SQLITE_ROW ? col_text (st, 0) : NULL;
+  sqlite3_finalize (st);
+  if (!path)
+    return NULL;
+  g_autoptr (GMappedFile) mf = g_mapped_file_new (path, FALSE, NULL);
+  return mf ? g_mapped_file_get_bytes (mf) : NULL;
+}
+
+void
+smail_store_message_stats (SMailStore *s, gint64 *count, gint64 *bytes)
+{
+  sqlite3_stmt *st = prepare (s, "SELECT COUNT(*), IFNULL(SUM(size), 0) FROM messages");
+  if (sqlite3_step (st) == SQLITE_ROW) {
+    *count = sqlite3_column_int64 (st, 0);
+    *bytes = sqlite3_column_int64 (st, 1);
+  }
+  sqlite3_finalize (st);
+}
+
+sqlite3 *
+smail_store_get_db (SMailStore *s)
+{
+  return s->db;
 }

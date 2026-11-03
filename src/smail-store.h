@@ -125,6 +125,14 @@ GPtrArray *smail_store_list_mail_log (SMailStore *s, const char *direction /* NU
 gint64     smail_store_get_last_uid (SMailStore *s, const char *account, const char *folder, gboolean *known);
 void       smail_store_set_last_uid (SMailStore *s, const char *account, const char *folder, gint64 uid);
 
+/* Downloaded messages: a full .eml copy of every message opened, kept under
+ * ~/.local/share/smail/mail/<account>/<folder>/<uid>.eml */
+char      *smail_store_mail_dir      (void);
+gboolean   smail_store_save_message  (SMailStore *s, const char *account, const char *folder, const char *uid,
+                                      GBytes *raw, char **path_out, GError **error);
+GBytes    *smail_store_load_message  (SMailStore *s, const char *account, const char *folder, const char *uid);
+void       smail_store_message_stats (SMailStore *s, gint64 *count, gint64 *bytes);
+
 /* LAN chat history */
 gboolean   smail_store_add_chat_message (SMailStore *s, SMailChatMessage *m, GError **error);
 GPtrArray *smail_store_list_chat_messages (SMailStore *s, const char *peer_id, int limit);

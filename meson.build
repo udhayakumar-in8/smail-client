@@ -34,6 +34,7 @@ core = static_library('smail-core',
   'src/smail-store.c',
   'src/smail-automation.c',
   'src/smail-lan.c',
+  'src/smail-backup.c',
   dependencies: deps,
 )
 
@@ -69,3 +70,10 @@ test('local', test_local, timeout: 60)
 
 install_data('data/io.github.udhayakumar_in8.SMail.desktop',
   install_dir: get_option('datadir') / 'applications')
+
+test_backup = executable('test-backup', 'tests/test-backup.c',
+  include_directories: include_directories('src'),
+  link_with: core,
+  dependencies: deps,
+)
+test('backup', test_backup, timeout: 60)

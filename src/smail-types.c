@@ -300,6 +300,7 @@ smail_message_detail_free (SMailMessageDetail *d)
   g_free (d->text);
   g_clear_pointer (&d->attachments, g_ptr_array_unref);
   g_clear_pointer (&d->inline_parts, g_ptr_array_unref);
+  g_clear_pointer (&d->raw, g_bytes_unref);
   g_free (d);
 }
 
@@ -382,6 +383,7 @@ smail_message_detail_parse (const char *uid, GBytes *raw, GError **error)
 
   SMailMessageDetail *d = g_new0 (SMailMessageDetail, 1);
   d->uid = g_strdup (uid);
+  d->raw = g_bytes_ref (raw);
   d->attachments = g_ptr_array_new_with_free_func ((GDestroyNotify) smail_attachment_free);
   d->inline_parts = g_ptr_array_new_with_free_func ((GDestroyNotify) smail_attachment_free);
 

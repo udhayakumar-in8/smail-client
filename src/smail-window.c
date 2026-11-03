@@ -633,6 +633,8 @@ adjust_unread (SMailWindow *self, int delta)
 typedef struct {
   SMailWindow  *self;
   SMailMessage *msg;
+  char         *account;  /* NULL for the demo: nothing is stored */
+  char         *folder;
 } FetchRequest;
 
 static void
@@ -649,6 +651,13 @@ on_message_fetched (GObject *source, GAsyncResult *res, gpointer data)
     gtk_stack_set_visible_child_name (GTK_STACK (self->viewer_stack), "empty");
     toast (self, error->message);
   } else {
+    /* keep a copy of every downloaded message in the local store */
+    if (req->account && detail->raw) {
+      g_autoptr (GError) save_error = NULL;
+      if (!smail_store_save_message (self->store, req->account, req->folder, detail->uid, detail->raw,
+                                     NULL, &save_error))
+        g_warning ("Could not save message locally: %s", save_error->message);
+    }
     if (!req->msg->seen) {
       smail_message_set_seen (req->msg, TRUE); /* the fetch marked it read */
       adjust_unread (self, -1);
@@ -660,7 +669,40 @@ on_message_fetched (GObject *source, GAsyncResult *res, gpointer data)
   update_actions (self);
   g_object_unref (req->self);
   g_object_unref (req->msg);
+  g_free (req->account);
+  g_free (req->folder);
   g_free (req);
+}
+
+static void
+on_seen_stored (GObject *source, GAsyncResult *res, gpointer data)
+{
+  g_autoptr (GError) error = NULL;
+  if (!smail_backend_finish_boolean (SMAIL_BACKEND (source), res, &error))
+    g_message ("Could not mark message as read on the server: %s", error->message);
+}
+
+/* Show a message from the local store. Returns FALSE if there is no usable copy. */
+static gboolean
+open_local_copy (SMailWindow *self, SMailMessage *msg, const char *account)
+{
+  g_autoptr (GBytes) raw = smail_store_load_message (self->store, account, self->current_folder, msg->uid);
+  if (!raw)
+    return FALSE;
+  SMailMessageDetail *detail = smail_message_detail_parse (msg->uid, raw, NULL);
+  if (!detail)
+    return FALSE;
+  if (!msg->seen) {
+    smail_message_set_seen (msg, TRUE);
+    adjust_unread (self, -1);
+    smail_backend_set_flag (self->current_ctx->backend, self->current_folder, msg->uid, "\\Seen", TRUE,
+                            on_seen_stored, NULL);
+  }
+  adw_navigation_page_set_title (ADW_NAVIGATION_PAGE (self->viewer_page), detail->subject);
+  smail_message_view_set_detail (SMAIL_MESSAGE_VIEW (self->viewer), detail);
+  gtk_stack_set_visible_child_name (GTK_STACK (self->viewer_stack), "message");
+  update_actions (self);
+  return TRUE;
 }
 
 static void
@@ -678,9 +720,16 @@ open_message (SMailWindow *self, SMailMessage *msg)
   gtk_stack_set_visible_child_name (GTK_STACK (self->viewer_stack), "loading");
   update_actions (self);
 
+  SMailBackend *backend = self->current_ctx->backend;
+  const char *account = smail_backend_is_demo (backend) ? NULL : smail_backend_get_account (backend)->email;
+  if (account && open_local_copy (self, msg, account))
+    return;
+
   FetchRequest *req = g_new0 (FetchRequest, 1);
   req->self = g_object_ref (self);
   req->msg = g_object_ref (msg);
+  req->account = g_strdup (account);
+  req->folder = g_strdup (self->current_folder);
   smail_backend_fetch_message (self->current_ctx->backend, self->current_folder, msg->uid,
                                  self->fetch_cancellable, on_message_fetched, req);
 }
