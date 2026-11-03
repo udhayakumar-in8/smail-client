@@ -3,11 +3,23 @@
 A native email client for Linux written in **C** with **GTK 4** and **libadwaita**, modelled on the
 three-pane layout of elementary OS Mail.
 
-![Reading an HTML newsletter, with remote images blocked](docs/reading-html.png)
+| Matte White | Matte Black |
+|---|---|
+| ![](docs/matte-white.png) | ![](docs/matte-black.png) |
 
-| Attachments & quoted text | Reply composer | Phone width |
-|---|---|---|
-| ![](docs/attachments.png) | ![](docs/reply.png) | ![](docs/narrow.png) |
+## Styles: Matte White and Matte Black
+
+Choose a style in **Main Menu → Style**:
+
+- **Matte White** and **Matte Black** are styled after elementary OS: the **Inter** typeface
+  throughout, the Blueberry blue accent, softly graded buttons with a fine border and drop shadow,
+  borderless icon buttons in header bars, blue suggested-action and red destructive-action buttons,
+  white or near-black bordered entries, and accent-tinted selection in the sidebar and message list.
+- **System Style** uses the standard libadwaita look and follows your desktop's light/dark setting.
+
+Your choice is remembered, and it is included in backups.
+
+![Reply composer in Matte Black](docs/reply.png)
 
 ## Features
 
@@ -33,6 +45,33 @@ three-pane layout of elementary OS Mail.
   (libsecret), never in the config file.
 - **Search** within the loaded folder, automatic refresh every 5 minutes, and keyboard shortcuts.
 - **Demo mode** (`--demo`) with sample mail, so you can try the app without an account.
+
+## Downloaded emails are kept
+
+Every message you open is saved as a full `.eml` file in
+`~/.local/share/smail/mail/<account>/<folder>/`. After that it opens instantly from the local
+copy, even offline, and the Mail Log links to it. (The `--demo` mailbox is never saved.)
+
+## Backup & Restore
+
+**Main Menu → Backup & Restore…** saves everything SMail keeps on this computer to one
+`.smailbackup` file:
+
+- email accounts (server settings, and optionally the passwords)
+- mail filters
+- calendar events, tasks and reminders
+- the mail log and local chat history
+- settings, including the style
+- every downloaded email and every copy of sent mail (optional)
+
+![Backup & Restore](docs/backup.png)
+
+**Restore** shows what a backup contains before anything changes. It saves a safety copy of your
+current data to `~/.local/share/smail/backups/` and then replaces your local data with the
+backup's. Passwords are restored into the keyring if the backup includes them; otherwise you
+enter them in Account Settings. Your Local Chat identity stays with this computer.
+
+Passwords in a backup are **not encrypted**, so only include them if you keep the file somewhere safe.
 
 ## Organizer and local features
 
@@ -121,7 +160,7 @@ These providers need IMAP turned on and, with two-factor authentication enabled,
 
 ```
 src/
-  main.c                    app startup, CSS, About dialog, shortcuts
+  main.c                  app startup, CSS, About dialog, shortcuts
   smail-window.c          the three-pane window, actions, account lifecycle
   smail-message-view.c    reading pane (header, attachments, sandboxed WebKit body)
   smail-composer.c        compose / reply / forward window, builds MIME with GMime
@@ -140,8 +179,12 @@ src/
   smail-mail-tools.c      Filters and Mail Log pages
   smail-chat-page.c       Local Chat page
   smail-ui.c              shared widgets (date-time picker, page helpers)
-tests/test-imap.c           IMAP/SMTP/MIME tests (offline + live server)
-tests/test-local.c          database, filters, mail log and LAN chat tests
+  smail-backup.c          single-file backup and restore (SQLite)
+  smail-backup-dialog.c   Backup & Restore dialog
+  smail-theme.c           System / Matte White / Matte Black styles
+tests/test-imap.c         IMAP/SMTP/MIME tests (offline + live server)
+tests/test-local.c        database, filters, mail log and LAN chat tests
+tests/test-backup.c       downloaded-mail store and backup/restore round trips
 ```
 
 The UI never blocks. `SMailBackend` serialises access to each account's IMAP connection with
@@ -151,7 +194,7 @@ or messages mid-request, the old request is cancelled or its result is discarded
 ## Tests
 
 ```bash
-meson test -C build      # UTF-7, MIME, text helpers, database, filters, mail log, LAN chat over loopback
+meson test -C build      # UTF-7, MIME, database, filters, mail log, LAN chat, backup/restore
 ```
 
 To try Local Chat with two copies on one computer, give the second copy its own data folders and

@@ -13,6 +13,8 @@
 #include "smail-mail-tools.h"
 #include "smail-chat-page.h"
 #include "smail-ui.h"
+#include "smail-theme.h"
+#include "smail-backup-dialog.h"
 
 #include <string.h>
 
@@ -286,8 +288,10 @@ rebuild_sidebar (SMailWindow *self)
 static void
 show_tool (SMailWindow *self, const char *tool)
 {
+  char *copy = g_strdup (tool); /* `tool` may be self->current_tool itself */
   g_free (self->current_tool);
-  self->current_tool = g_strdup (tool);
+  self->current_tool = copy;
+  tool = copy;
   gtk_stack_set_visible_child_name (GTK_STACK (self->content_stack), tool ? tool : "mail");
   smail_chat_page_set_active (self->chat_page, g_strcmp0 (tool, "chat") == 0);
 
@@ -1441,7 +1445,83 @@ try_demo_activated (GSimpleAction *a, GVariant *p, gpointer data)
   reload_accounts (self);
 }
 
+/* --- style --- */
+
+static void
+theme_change_state (GSimpleAction *action, GVariant *value, gpointer data)
+{
+  SMailWindow *self = data;
+  const char *name = g_variant_get_string (value, NULL);
+  if (!smail_theme_is_valid (name))
+    return;
+  smail_theme_apply (name);
+  smail_store_set_setting (self->store, "theme", name);
+  g_simple_action_set_state (action, value);
+}
+
+static void
+sync_theme_from_store (SMailWindow *self)
+{
+  g_autofree char *theme = smail_store_get_setting (self->store, "theme");
+  if (!smail_theme_is_valid (theme)) {
+    g_free (theme);
+    theme = g_strdup (SMAIL_THEME_SYSTEM);
+  }
+  smail_theme_apply (theme);
+  GAction *action = g_action_map_lookup_action (G_ACTION_MAP (self), "theme");
+  if (action)
+    g_simple_action_set_state (G_SIMPLE_ACTION (action), g_variant_new_string (theme));
+}
+
+/* --- backup & restore --- */
+
+static void
+on_restored (GPtrArray *accounts, gboolean had_passwords, gpointer data)
+{
+  SMailWindow *self = data;
+
+  /* forget passwords of accounts that are going away */
+  for (guint i = 0; i < self->accounts->len; i++)
+    smail_accounts_clear_password (((SMailAccount *) g_ptr_array_index (self->accounts, i))->id);
+  g_ptr_array_set_size (self->accounts, 0);
+
+  gboolean keyring_failed = FALSE;
+  for (guint i = 0; i < accounts->len; i++) {
+    SMailAccount *a = smail_account_copy (g_ptr_array_index (accounts, i));
+    if (a->password && *a->password && !smail_accounts_store_password (a, NULL))
+      keyring_failed = TRUE;
+    g_ptr_array_add (self->accounts, a);
+  }
+  g_autoptr (GError) error = NULL;
+  if (!smail_accounts_save (self->accounts, &error))
+    toast (self, error->message);
+
+  self->demo = FALSE;
+  g_autofree char *skip = smail_store_get_setting (self->store, "skip-welcome");
+  self->skip_welcome = g_strcmp0 (skip, "1") == 0;
+  sync_theme_from_store (self);
+  reload_accounts (self);
+  if (self->current_tool)
+    show_tool (self, self->current_tool);
+
+  if (accounts->len && !had_passwords)
+    toast (self, "Backup restored. Enter your passwords in Account Settings to connect.");
+  else if (keyring_failed)
+    toast (self, "Backup restored, but passwords couldn't be saved to the keyring");
+  else
+    toast (self, "Backup restored");
+}
+
+static void
+backup_activated (GSimpleAction *a, GVariant *p, gpointer data)
+{
+  SMailWindow *self = data;
+  smail_backup_dialog_present (GTK_WIDGET (self), self->store, self->accounts, on_restored, self);
+}
+
 static const GActionEntry win_actions[] = {
+  { "theme",          NULL, "s", "'system'", theme_change_state },
+  { "backup",         backup_activated },
   { "compose",        compose_activated },
   { "reply",          reply_activated },
   { "reply-all",      reply_all_activated },
@@ -1519,6 +1599,16 @@ primary_menu (void)
   g_menu_append (accounts, "Account _Settings…", "win.edit-account");
   g_menu_append (accounts, "_Remove Account…", "win.remove-account");
   g_menu_append_section (menu, NULL, G_MENU_MODEL (accounts));
+  GMenu *style = g_menu_new ();
+  g_menu_append (style, "_System Style", "win.theme::system");
+  g_menu_append (style, "Matte _White", "win.theme::matte-white");
+  g_menu_append (style, "Matte _Black", "win.theme::matte-black");
+  g_menu_append_section (menu, "Style", G_MENU_MODEL (style));
+  g_object_unref (style);
+  GMenu *data = g_menu_new ();
+  g_menu_append (data, "_Backup & Restore…", "win.backup");
+  g_menu_append_section (menu, NULL, G_MENU_MODEL (data));
+  g_object_unref (data);
   GMenu *app = g_menu_new ();
   g_menu_append (app, "_Keyboard Shortcuts", "app.shortcuts");
   g_menu_append (app, "_About SMail", "app.about");
@@ -1832,6 +1922,7 @@ smail_window_new (AdwApplication *app, gboolean demo)
 {
   SMailWindow *self = g_object_new (SMAIL_TYPE_WINDOW, "application", app, NULL);
   self->demo = demo;
+  sync_theme_from_store (self);
   if (demo) /* the demo mailbox is new every time: record it from scratch */
     smail_store_set_last_uid (self->store, "demo", "INBOX", 0);
   reload_accounts (self);
