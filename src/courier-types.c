@@ -138,6 +138,7 @@ courier_message_finalize (GObject *object)
   g_free (self->sender_name);
   g_free (self->sender_addr);
   g_free (self->recipient);
+  g_free (self->to);
   g_clear_pointer (&self->date, g_date_time_unref);
   G_OBJECT_CLASS (courier_message_parent_class)->finalize (object);
 }
@@ -248,6 +249,9 @@ courier_message_new_from_headers (const char *uid, GBytes *headers, gboolean see
     g_autofree char *rname = NULL, *raddr = NULL;
     first_mailbox (g_mime_message_get_to (msg), &rname, &raddr);
     self->recipient = g_strdup (rname && *rname ? rname : raddr);
+    InternetAddressList *to = g_mime_message_get_to (msg);
+    if (to && internet_address_list_length (to))
+      self->to = internet_address_list_to_string (to, NULL, FALSE);
     GDateTime *date = g_mime_message_get_date (msg);
     if (date)
       self->date = g_date_time_to_local (date);

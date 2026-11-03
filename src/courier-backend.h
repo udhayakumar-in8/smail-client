@@ -50,6 +50,8 @@ void       courier_backend_set_flag      (CourierBackend *self, const char *fold
                                           GAsyncReadyCallback cb, gpointer data);
 void       courier_backend_archive       (CourierBackend *self, const char *folder, const char *uid,
                                           GAsyncReadyCallback cb, gpointer data);
+void       courier_backend_move          (CourierBackend *self, const char *folder, const char *uid,
+                                          const char *dest, GAsyncReadyCallback cb, gpointer data);
 void       courier_backend_trash         (CourierBackend *self, const char *folder, const char *uid,
                                           GAsyncReadyCallback cb, gpointer data);
 void       courier_backend_send          (CourierBackend *self, GBytes *message, const char *from,

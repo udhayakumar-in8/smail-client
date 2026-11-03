@@ -20,6 +20,8 @@ deps = [
   dependency('gmime-3.0'),
   dependency('libsecret-1'),
   dependency('libcurl'),
+  dependency('sqlite3'),
+  dependency('json-glib-1.0', version: '>= 1.6'),
 ]
 
 core = static_library('courier-core',
@@ -29,6 +31,9 @@ core = static_library('courier-core',
   'src/courier-demo.c',
   'src/courier-smtp.c',
   'src/courier-util.c',
+  'src/courier-store.c',
+  'src/courier-automation.c',
+  'src/courier-lan.c',
   dependencies: deps,
 )
 
@@ -50,6 +55,13 @@ test_imap = executable('test-imap', 'tests/test-imap.c',
   dependencies: deps,
 )
 test('imap', test_imap, timeout: 60)
+
+test_local = executable('test-local', 'tests/test-local.c',
+  include_directories: include_directories('src'),
+  link_with: core,
+  dependencies: deps,
+)
+test('local', test_local, timeout: 60)
 
 install_data('data/dev.courier.Mail.desktop',
   install_dir: get_option('datadir') / 'applications')

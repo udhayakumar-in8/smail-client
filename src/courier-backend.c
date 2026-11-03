@@ -80,6 +80,7 @@ typedef enum {
   JOB_SET_FLAG,
   JOB_ARCHIVE,
   JOB_TRASH,
+  JOB_MOVE,
   JOB_SEND,
 } JobKind;
 
@@ -186,6 +187,12 @@ run_job (GTask *task, gpointer source, gpointer task_data, GCancellable *cancell
       g_task_return_boolean (task, TRUE);
     break;
   }
+  case JOB_MOVE:
+    if (g_str_equal (job->folder, job->flag))
+      g_task_return_boolean (task, TRUE);
+    else if (klass->move (self, job->folder, job->uid, job->flag, &error))
+      g_task_return_boolean (task, TRUE);
+    break;
   case JOB_SEND:
     if (klass->send (self, job->message, job->from, (const char * const *) job->recipients, &error)) {
       const CourierFolder *sent = courier_backend_find_role (self, "sent");
@@ -276,6 +283,18 @@ courier_backend_trash (CourierBackend *self, const char *folder, const char *uid
   job->kind = JOB_TRASH;
   job->folder = g_strdup (folder);
   job->uid = g_strdup (uid);
+  start_job (self, job, NULL, cb, data);
+}
+
+void
+courier_backend_move (CourierBackend *self, const char *folder, const char *uid, const char *dest,
+                      GAsyncReadyCallback cb, gpointer data)
+{
+  Job *job = g_new0 (Job, 1);
+  job->kind = JOB_MOVE;
+  job->folder = g_strdup (folder);
+  job->uid = g_strdup (uid);
+  job->flag = g_strdup (dest); /* destination folder */
   start_job (self, job, NULL, cb, data);
 }
 

@@ -59,6 +59,7 @@ struct _CourierMessage {
   char      *sender_name;
   char      *sender_addr;
   char      *recipient;   /* first To: name or address, shown in Sent/Drafts */
+  char      *to;          /* full To: list */
   GDateTime *date;
   gboolean   seen;
   gboolean   flagged;
