@@ -1,17 +1,56 @@
 name: Release
 
-# Push a tag that matches the version in meson.build, e.g.
-#   git tag -a v0.1.0 -m "SMail 0.1.0" && git push origin v0.1.0
+# A release is published for every new version:
+#   - automatically, when a push to main carries a version in meson.build
+#     that has no release yet (GitHub creates the v<version> tag), or
+#   - when you push a matching tag yourself:
+#       git tag -a v0.2.0 -m "SMail 0.2.0" && git push origin v0.2.0
 on:
   push:
+    branches: [main]
     tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
+  check:
+    name: Is there a new version?
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      publish: ${{ steps.check.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="$(sed -n "s/^ *version: *'\([^']*\)'.*/\1/p" meson.build | head -n1)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match version $VERSION in meson.build"
+              exit 1
+            fi
+          fi
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release v$VERSION already exists, nothing to do."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Version $VERSION has no release yet, publishing."
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
   release:
     name: Build & publish release
+    needs: check
+    if: needs.check.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -26,16 +65,6 @@ jobs:
             libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev libgmime-3.0-dev \
             libsecret-1-dev libcurl4-openssl-dev libsqlite3-dev libjson-glib-dev \
             glib-networking dovecot-imapd
-
-      - name: Check that the tag matches meson.build
-        id: version
-        run: |
-          VERSION="$(meson introspect --projectinfo meson.build | jq -r .version)"
-          if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match version $VERSION in meson.build"
-            exit 1
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Build and test
         run: |
@@ -62,7 +91,7 @@ jobs:
 
       - name: Release notes
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
+          VERSION="${{ needs.check.outputs.version }}"
           # the CHANGELOG section for this version, up to the next "## " heading
           awk -v v="$VERSION" '
             $0 ~ "^## \\[?" v "\\]?" { found = 1; next }
@@ -88,7 +117,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "SMail ${{ steps.version.outputs.version }}" \
-            --notes-file notes.md \
-            --verify-tag
+          VERSION="${{ needs.check.outputs.version }}"
+          gh release create "v$VERSION" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "SMail $VERSION" \
+            --notes-file notes.md

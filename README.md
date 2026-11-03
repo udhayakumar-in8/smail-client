@@ -231,19 +231,11 @@ SMAIL_TEST_IMAP=127.0.0.1:143 SMAIL_TEST_USER=test SMAIL_TEST_PASS=secret SMAIL_
 The [CI workflow](.github/workflows/ci.yml) builds and tests every push and pull request. It also
 runs the IMAP/SMTP tests against a temporary Dovecot server and uploads a `.deb` as a build artifact.
 
-To publish a release, set the version in `meson.build`, add a section to `CHANGELOG.md`, then push
-a matching tag:
-
-```bash
-git tag -a v0.1.0 -m "SMail 0.1.0"
-```
-```bash
-git push origin v0.1.0
-```
-
-The [release workflow](.github/workflows/release.yml) then builds and tests everything again, and
-publishes a GitHub release with the source tarball, the Ubuntu 24.04 `.deb`, `SHA256SUMS` and the
-changelog notes.
+To publish a release, change the version in `meson.build`, add a section for it to
+`CHANGELOG.md`, and push to `main`. The [release workflow](.github/workflows/release.yml) sees
+the version has no release yet. It then builds and tests everything again, creates the
+`v<version>` tag, and publishes a GitHub release with the source tarball, the Ubuntu 24.04 `.deb`,
+`SHA256SUMS` and the changelog notes. Pushing a matching `v<version>` tag yourself works too.
 
 ## Not yet implemented
 
