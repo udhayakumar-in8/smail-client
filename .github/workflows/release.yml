@@ -1,0 +1,91 @@
+name: Release
+
+# Push a tag that matches the version in meson.build, e.g.
+#   git tag -a v0.1.0 -m "SMail 0.1.0" && git push origin v0.1.0
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & publish release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential meson pkg-config dpkg-dev jq \
+            libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev libgmime-3.0-dev \
+            libsecret-1-dev libcurl4-openssl-dev libsqlite3-dev libjson-glib-dev \
+            glib-networking dovecot-imapd
+
+      - name: Check that the tag matches meson.build
+        id: version
+        run: |
+          VERSION="$(meson introspect --projectinfo meson.build | jq -r .version)"
+          if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match version $VERSION in meson.build"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build and test
+        run: |
+          meson setup build -Dwerror=true
+          meson compile -C build
+          meson test -C build --print-errorlogs
+          eval "$(tests/live-servers.sh)"
+          ./build/test-imap
+
+      - name: Source tarball
+        run: |
+          meson dist -C build --formats xztar --no-tests
+          mkdir -p dist
+          cp build/meson-dist/*.tar.xz dist/
+
+      - name: Ubuntu 24.04 package
+        run: packaging/build-deb.sh dist
+
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - name: Release notes
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          # the CHANGELOG section for this version, up to the next "## " heading
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[?" v "\\]?" { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          cat >> notes.md <<'NOTES'
+
+          ### Install
+
+          **Ubuntu 24.04 or newer:** download the `.deb` below, then run
+
+          ```bash
+          sudo apt install ./smail_*.deb
+          ```
+
+          **Other distributions:** build from the source tarball, following the README.
+          NOTES
+          sed -i 's/^          //' notes.md
+          cat notes.md
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "SMail ${{ steps.version.outputs.version }}" \
+            --notes-file notes.md \
+            --verify-tag

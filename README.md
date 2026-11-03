@@ -1,5 +1,9 @@
 # SMail
 
+[![CI](https://github.com/udhayakumar-in8/smail-client/actions/workflows/ci.yml/badge.svg)](https://github.com/udhayakumar-in8/smail-client/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/udhayakumar-in8/smail-client)](https://github.com/udhayakumar-in8/smail-client/releases/latest)
+[![License: GPL v3](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
+
 A native email client for Linux written in **C** with **GTK 4** and **libadwaita**, modelled on the
 three-pane layout of elementary OS Mail.
 
@@ -108,6 +112,17 @@ New mail is detected when SMail refreshes: at start-up, every 5 minutes, or when
 The first sync of an account records what is already in the Inbox. After that, each new message
 is logged, filtered and announced with a notification.
 
+## Installing
+
+**Ubuntu 24.04 or newer:** download the `.deb` from the
+[latest release](https://github.com/udhayakumar-in8/smail-client/releases/latest), then:
+
+```bash
+sudo apt install ./smail_*.deb
+```
+
+On other distributions, build from source as described below.
+
 ## Building
 
 Requirements: GTK ≥ 4.12, libadwaita ≥ 1.5, WebKitGTK 6.0, GMime 3, libsecret, libcurl, SQLite 3, json-glib ≥ 1.6, Meson.
@@ -210,6 +225,25 @@ throwaway test account**) and an SMTP server:
 ```bash
 SMAIL_TEST_IMAP=127.0.0.1:143 SMAIL_TEST_USER=test SMAIL_TEST_PASS=secret SMAIL_TEST_SMTP=127.0.0.1:25 ./build/test-imap
 ```
+
+## Releases
+
+The [CI workflow](.github/workflows/ci.yml) builds and tests every push and pull request. It also
+runs the IMAP/SMTP tests against a temporary Dovecot server and uploads a `.deb` as a build artifact.
+
+To publish a release, set the version in `meson.build`, add a section to `CHANGELOG.md`, then push
+a matching tag:
+
+```bash
+git tag -a v0.1.0 -m "SMail 0.1.0"
+```
+```bash
+git push origin v0.1.0
+```
+
+The [release workflow](.github/workflows/release.yml) then builds and tests everything again, and
+publishes a GitHub release with the source tarball, the Ubuntu 24.04 `.deb`, `SHA256SUMS` and the
+changelog notes.
 
 ## Not yet implemented
 

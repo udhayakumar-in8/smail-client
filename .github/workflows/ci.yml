@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build & test (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential meson pkg-config dpkg-dev \
+            libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev libgmime-3.0-dev \
+            libsecret-1-dev libcurl4-openssl-dev libsqlite3-dev libjson-glib-dev \
+            glib-networking dovecot-imapd desktop-file-utils
+
+      - name: Configure
+        run: meson setup build -Dwerror=true
+
+      - name: Build
+        run: meson compile -C build
+
+      - name: Unit tests
+        run: meson test -C build --print-errorlogs
+
+      - name: Live IMAP/SMTP tests (local Dovecot + SMTP sink)
+        run: |
+          eval "$(tests/live-servers.sh)"
+          ./build/test-imap
+
+      - name: Validate desktop file
+        run: desktop-file-validate data/*.desktop
+
+      - name: Build .deb
+        run: packaging/build-deb.sh dist
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: smail-deb-${{ github.sha }}
+          path: dist/*.deb
+          if-no-files-found: error
