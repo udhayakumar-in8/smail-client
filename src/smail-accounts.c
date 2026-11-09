@@ -65,6 +65,7 @@ smail_accounts_load (void)
     a->smtp_port = g_key_file_get_integer (kf, g, "smtp-port", NULL);
     g_autofree char *ss = g_key_file_get_string (kf, g, "smtp-security", NULL);
     a->smtp_security = security_from_string (ss);
+    a->signature = g_key_file_get_string (kf, g, "signature", NULL);
 
     g_autoptr (GError) error = NULL;
     a->password = secret_password_lookup_sync (password_schema (), NULL, &error, "account-id", a->id, NULL);
@@ -92,6 +93,8 @@ smail_accounts_save (GPtrArray *accounts, GError **error)
     g_key_file_set_string (kf, g, "smtp-host", a->smtp_host ? a->smtp_host : "");
     g_key_file_set_integer (kf, g, "smtp-port", a->smtp_port);
     g_key_file_set_string (kf, g, "smtp-security", security_to_string (a->smtp_security));
+    if (a->signature && *a->signature)
+      g_key_file_set_string (kf, g, "signature", a->signature);
   }
   g_autofree char *path = config_path ();
   g_autofree char *dir = g_path_get_dirname (path);

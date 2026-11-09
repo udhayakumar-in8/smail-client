@@ -48,13 +48,15 @@ describe (const SMailBackupSummary *s)
   GString *out = g_string_new (NULL);
   g_string_append_printf (out, "%" G_GINT64_FORMAT " account%s, %" G_GINT64_FORMAT " filter%s, "
                           "%" G_GINT64_FORMAT " event%s, %" G_GINT64_FORMAT " task%s, "
-                          "%" G_GINT64_FORMAT " mail log entr%s, %" G_GINT64_FORMAT " chat message%s",
+                          "%" G_GINT64_FORMAT " mail log entr%s, %" G_GINT64_FORMAT " chat message%s, "
+                          "%" G_GINT64_FORMAT " contact%s",
                           s->accounts, s->accounts == 1 ? "" : "s",
                           s->filters, s->filters == 1 ? "" : "s",
                           s->events, s->events == 1 ? "" : "s",
                           s->todos, s->todos == 1 ? "" : "s",
                           s->log_entries, s->log_entries == 1 ? "y" : "ies",
-                          s->chat_messages, s->chat_messages == 1 ? "" : "s");
+                          s->chat_messages, s->chat_messages == 1 ? "" : "s",
+                          s->contacts, s->contacts == 1 ? "" : "s");
   if (s->emails)
     g_string_append_printf (out, " and %" G_GINT64_FORMAT " email%s (%s)", s->emails, s->emails == 1 ? "" : "s", size);
   g_string_append (out, s->passwords ? ". Passwords included." : ". Passwords not included.");
@@ -283,8 +285,8 @@ smail_backup_dialog_present (GtkWidget *parent, SMailStore *store, GPtrArray *ac
   ui->page = adw_preferences_page_new ();
   AdwPreferencesGroup *g = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
   adw_preferences_group_set_title (g, "Back Up");
-  adw_preferences_group_set_description (g, "Save your accounts, mail filters, calendar, tasks, reminders, "
-                                            "mail log, local chat history and settings to a single file.");
+  adw_preferences_group_set_description (g, "Save your accounts, contacts, mail filters, calendar, tasks, "
+                                            "reminders, mail log, local chat history and settings to a single file.");
   gint64 count = 0, bytes = 0;
   smail_store_message_stats (store, &count, &bytes);
   g_autofree char *size = g_format_size (bytes);

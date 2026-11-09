@@ -58,6 +58,7 @@ make_accounts (void)
   a->smtp_host = g_strdup ("smtp.example.org");
   a->smtp_security = SMAIL_SECURITY_STARTTLS;
   a->smtp_port = 587;
+  a->signature = g_strdup ("Cheers,\nMe");
   g_ptr_array_add (accounts, a);
   return accounts;
 }
@@ -141,6 +142,7 @@ test_round_trip (void)
   g_assert_cmpstr (ra->password, ==, "s3cret");
   g_assert_cmpint (ra->smtp_port, ==, 587);
   g_assert_cmpint (ra->smtp_security, ==, SMAIL_SECURITY_STARTTLS);
+  g_assert_cmpstr (ra->signature, ==, "Cheers,\nMe");
 
   g_autoptr (GPtrArray) filters = smail_store_list_filters (b);
   g_assert_cmpuint (filters->len, ==, 1);

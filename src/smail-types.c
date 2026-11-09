@@ -30,6 +30,7 @@ smail_account_copy (const SMailAccount *src)
   a->smtp_host = g_strdup (src->smtp_host);
   a->smtp_port = src->smtp_port;
   a->smtp_security = src->smtp_security;
+  a->signature = g_strdup (src->signature);
   return a;
 }
 
@@ -47,6 +48,7 @@ smail_account_free (SMailAccount *a)
   g_free (a->password);
   g_free (a->imap_host);
   g_free (a->smtp_host);
+  g_free (a->signature);
   g_free (a);
 }
 
@@ -298,6 +300,8 @@ smail_message_detail_free (SMailMessageDetail *d)
   g_clear_pointer (&d->date, g_date_time_unref);
   g_free (d->message_id);
   g_free (d->references);
+  g_free (d->in_reply_to);
+  g_free (d->bcc);
   g_free (d->html);
   g_free (d->text);
   g_clear_pointer (&d->attachments, g_ptr_array_unref);
@@ -411,6 +415,10 @@ smail_message_detail_parse (const char *uid, GBytes *raw, GError **error)
     d->date = g_date_time_to_local (date);
   d->message_id = g_strdup (g_mime_message_get_message_id (msg));
   d->references = g_strdup (g_mime_object_get_header (GMIME_OBJECT (msg), "References"));
+  d->in_reply_to = g_strdup (g_mime_object_get_header (GMIME_OBJECT (msg), "In-Reply-To"));
+  InternetAddressList *bcc = g_mime_message_get_bcc (msg);
+  if (bcc && internet_address_list_length (bcc))
+    d->bcc = internet_address_list_to_string (bcc, NULL, FALSE);
 
   g_mime_message_foreach (msg, collect_part, d);
 

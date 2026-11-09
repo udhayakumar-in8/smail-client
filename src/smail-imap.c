@@ -666,6 +666,26 @@ smail_imap_search (SMailImap *imap, const char *folder, const char *query, guint
   return uids ? fetch_summaries (imap, uids, limit, error) : NULL;
 }
 
+int
+smail_imap_delete_by_message_id (SMailImap *imap, const char *folder, const char *message_id, GError **error)
+{
+  g_clear_pointer (&imap->selected, g_free);
+  if (!imap_select (imap, folder, error))
+    return -1;
+  g_autofree char *bracketed = message_id[0] == '<' ? g_strdup (message_id) : g_strdup_printf ("<%s>", message_id);
+  g_autofree char *q = imap_quote (bracketed);
+  g_autofree char *criteria = g_strdup_printf ("HEADER Message-ID %s", q);
+  g_autoptr (GArray) uids = search_uids (imap, NULL, error, criteria);
+  if (!uids)
+    return -1;
+  for (guint i = 0; i < uids->len; i++) {
+    g_autofree char *uid = g_strdup_printf ("%" G_GUINT64_FORMAT, g_array_index (uids, guint64, i));
+    if (!smail_imap_delete (imap, folder, uid, error))
+      return -1;
+  }
+  return uids->len;
+}
+
 gboolean
 smail_imap_create_folder (SMailImap *imap, const char *name, GError **error)
 {

@@ -32,6 +32,9 @@ gboolean     smail_imap_move          (SMailImap *imap, const char *folder, cons
 gboolean     smail_imap_delete        (SMailImap *imap, const char *folder, const char *uid, GError **error);
 GPtrArray   *smail_imap_search         (SMailImap *imap, const char *folder, const char *query,
                                         guint limit, GError **error);           /* SMailMessage* */
+/* Permanently delete every message in `folder` with this Message-ID; returns how many, -1 on error. */
+int          smail_imap_delete_by_message_id (SMailImap *imap, const char *folder, const char *message_id,
+                                              GError **error);
 gboolean     smail_imap_create_folder  (SMailImap *imap, const char *name, GError **error);
 gboolean     smail_imap_rename_folder  (SMailImap *imap, const char *from, const char *to, GError **error);
 gboolean     smail_imap_delete_folder  (SMailImap *imap, const char *name, GError **error);

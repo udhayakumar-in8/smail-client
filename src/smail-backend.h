@@ -27,6 +27,8 @@ struct _SMailBackendClass {
   gboolean   (*create_folder) (SMailBackend *self, const char *name, GError **error);
   gboolean   (*rename_folder) (SMailBackend *self, const char *from, const char *to, GError **error);
   gboolean   (*delete_folder) (SMailBackend *self, const char *name, GError **error);
+  int        (*delete_by_message_id) (SMailBackend *self, const char *folder, const char *message_id,
+                                      GError **error);
   gboolean   (*send)          (SMailBackend *self, GBytes *message, const char *from,
                                const char * const *recipients, GError **error);
   /* Whether the server files sent mail on its own (Gmail, Outlook...) */
@@ -74,6 +76,13 @@ void       smail_backend_create_folder   (SMailBackend *self, const char *name,
 void       smail_backend_rename_folder   (SMailBackend *self, const char *from, const char *to,
                                           GAsyncReadyCallback cb, gpointer data);
 void       smail_backend_delete_folder   (SMailBackend *self, const char *name,
+                                          GAsyncReadyCallback cb, gpointer data);
+/* Replace drafts: remove every copy with this Message-ID from `folder`, then
+ * (if `message` is not NULL) append `message` with `flags`. */
+void       smail_backend_save_draft      (SMailBackend *self, const char *folder, const char *message_id,
+                                          GBytes *message, const char *flags,
+                                          GAsyncReadyCallback cb, gpointer data);
+void       smail_backend_delete_message  (SMailBackend *self, const char *folder, const char *uid,
                                           GAsyncReadyCallback cb, gpointer data);
 /* Folder separator used by the server ("/" or "."), known after list_folders. */
 const char *smail_backend_get_delimiter  (SMailBackend *self);

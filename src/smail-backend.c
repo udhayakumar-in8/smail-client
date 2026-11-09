@@ -87,6 +87,8 @@ typedef enum {
   JOB_CREATE_FOLDER,
   JOB_RENAME_FOLDER,
   JOB_DELETE_FOLDER,
+  JOB_SAVE_DRAFT,
+  JOB_DELETE_MESSAGE,
 } JobKind;
 
 typedef struct {
@@ -220,6 +222,16 @@ run_job (GTask *task, gpointer source, gpointer task_data, GCancellable *cancell
     break;
   case JOB_DELETE_FOLDER:
     if (klass->delete_folder (self, job->folder, &error))
+      g_task_return_boolean (task, TRUE);
+    break;
+  case JOB_SAVE_DRAFT:
+    /* job->uid carries the Message-ID; message may be NULL ("just delete") */
+    if (klass->delete_by_message_id (self, job->folder, job->uid, &error) >= 0 &&
+        (!job->message || klass->append (self, job->folder, job->message, job->flag, &error)))
+      g_task_return_boolean (task, TRUE);
+    break;
+  case JOB_DELETE_MESSAGE:
+    if (klass->remove (self, job->folder, job->uid, &error))
       g_task_return_boolean (task, TRUE);
     break;
   case JOB_SEND:
@@ -386,6 +398,25 @@ smail_backend_delete_folder (SMailBackend *self, const char *name, GAsyncReadyCa
   start_job (self, new_job (JOB_DELETE_FOLDER, name, NULL), NULL, cb, data);
 }
 
+void
+smail_backend_save_draft (SMailBackend *self, const char *folder, const char *message_id, GBytes *message,
+                          const char *flags, GAsyncReadyCallback cb, gpointer data)
+{
+  Job *job = new_job (JOB_SAVE_DRAFT, folder, flags ? flags : "");
+  job->uid = g_strdup (message_id);
+  job->message = message ? g_bytes_ref (message) : NULL;
+  start_job (self, job, NULL, cb, data);
+}
+
+void
+smail_backend_delete_message (SMailBackend *self, const char *folder, const char *uid,
+                              GAsyncReadyCallback cb, gpointer data)
+{
+  Job *job = new_job (JOB_DELETE_MESSAGE, folder, NULL);
+  job->uid = g_strdup (uid);
+  start_job (self, job, NULL, cb, data);
+}
+
 const char *
 smail_backend_get_delimiter (SMailBackend *self)
 {
@@ -549,6 +580,15 @@ imap_rename_folder (SMailBackend *backend, const char *from, const char *to, GEr
   return res;
 }
 
+static int
+imap_delete_by_message_id (SMailBackend *backend, const char *folder, const char *message_id, GError **error)
+{
+  SMailImapBackend *self = SMAIL_IMAP_BACKEND (backend);
+  int res = -1;
+  WITH_RETRY (res, smail_imap_delete_by_message_id (imap, folder, message_id, error_));
+  return res;
+}
+
 static gboolean
 imap_delete_folder (SMailBackend *backend, const char *name, GError **error)
 {
@@ -597,6 +637,7 @@ smail_imap_backend_class_init (SMailImapBackendClass *klass)
   bc->create_folder = imap_create_folder;
   bc->rename_folder = imap_rename_folder;
   bc->delete_folder = imap_delete_folder;
+  bc->delete_by_message_id = imap_delete_by_message_id;
   bc->send = imap_send;
   bc->saves_sent = imap_saves_sent;
 }

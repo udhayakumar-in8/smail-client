@@ -41,6 +41,10 @@ static const char *schema =
   "  id INTEGER PRIMARY KEY AUTOINCREMENT, peer_id TEXT NOT NULL, peer_name TEXT, outgoing INTEGER NOT NULL,"
   "  text TEXT NOT NULL, ts INTEGER NOT NULL);"
   "CREATE INDEX IF NOT EXISTS lan_messages_peer ON lan_messages(peer_id, ts);"
+  "CREATE TABLE IF NOT EXISTS contacts ("
+  "  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT NOT NULL COLLATE NOCASE UNIQUE, phone TEXT,"
+  "  notes TEXT, favorite INTEGER NOT NULL DEFAULT 0, collected INTEGER NOT NULL DEFAULT 0,"
+  "  use_count INTEGER NOT NULL DEFAULT 0, last_used INTEGER NOT NULL DEFAULT 0);"
   "CREATE TABLE IF NOT EXISTS messages (account TEXT NOT NULL, folder TEXT NOT NULL, uid TEXT NOT NULL,"
   "  path TEXT NOT NULL, size INTEGER NOT NULL, saved INTEGER NOT NULL, PRIMARY KEY (account, folder, uid));";
 
@@ -786,4 +790,162 @@ sqlite3 *
 smail_store_get_db (SMailStore *s)
 {
   return s->db;
+}
+
+/* ---------------- contacts ---------------- */
+
+void
+smail_contact_free (SMailContact *c)
+{
+  if (!c) return;
+  g_free (c->name); g_free (c->email); g_free (c->phone); g_free (c->notes);
+  g_free (c);
+}
+
+SMailContact *
+smail_contact_copy (const SMailContact *src)
+{
+  SMailContact *c = g_memdup2 (src, sizeof *src);
+  c->name = g_strdup (src->name);
+  c->email = g_strdup (src->email);
+  c->phone = g_strdup (src->phone);
+  c->notes = g_strdup (src->notes);
+  return c;
+}
+
+#define CONTACT_COLS "id, name, email, phone, notes, favorite, collected, use_count, last_used"
+
+static SMailContact *
+read_contact (sqlite3_stmt *st)
+{
+  SMailContact *c = g_new0 (SMailContact, 1);
+  c->id = sqlite3_column_int64 (st, 0);
+  c->name = col_text (st, 1);
+  c->email = col_text (st, 2);
+  c->phone = col_text (st, 3);
+  c->notes = col_text (st, 4);
+  c->favorite = sqlite3_column_int (st, 5);
+  c->collected = sqlite3_column_int (st, 6);
+  c->use_count = sqlite3_column_int64 (st, 7);
+  c->last_used = sqlite3_column_int64 (st, 8);
+  return c;
+}
+
+GPtrArray *
+smail_store_list_contacts (SMailStore *s, const char *query, int limit)
+{
+  GPtrArray *out = g_ptr_array_new_with_free_func ((GDestroyNotify) smail_contact_free);
+  /* prefix matches on a word of the name or the address rank above substring matches */
+  sqlite3_stmt *st = prepare (s,
+    "SELECT " CONTACT_COLS " FROM contacts WHERE ?1 IS NULL OR name LIKE ?2 OR email LIKE ?2 "
+    "ORDER BY (?1 IS NOT NULL AND (name LIKE ?3 OR name LIKE ?4 OR email LIKE ?3)) DESC, "
+    "favorite DESC, collected ASC, use_count DESC, last_used DESC, IFNULL(name, email) COLLATE NOCASE "
+    "LIMIT ?5");
+  g_autofree char *any = query && *query ? g_strdup_printf ("%%%s%%", query) : NULL;
+  g_autofree char *prefix = query && *query ? g_strdup_printf ("%s%%", query) : NULL;
+  g_autofree char *word = query && *query ? g_strdup_printf ("%% %s%%", query) : NULL;
+  bind_text (st, 1, query && *query ? query : NULL);
+  bind_text (st, 2, any);
+  bind_text (st, 3, prefix);
+  bind_text (st, 4, word);
+  sqlite3_bind_int (st, 5, limit > 0 ? limit : -1);
+  while (sqlite3_step (st) == SQLITE_ROW)
+    g_ptr_array_add (out, read_contact (st));
+  sqlite3_finalize (st);
+  return out;
+}
+
+SMailContact *
+smail_store_find_contact (SMailStore *s, const char *email)
+{
+  sqlite3_stmt *st = prepare (s, "SELECT " CONTACT_COLS " FROM contacts WHERE email = ?");
+  bind_text (st, 1, email);
+  SMailContact *c = sqlite3_step (st) == SQLITE_ROW ? read_contact (st) : NULL;
+  sqlite3_finalize (st);
+  return c;
+}
+
+static gboolean
+valid_address (const char *email)
+{
+  const char *at = email ? strchr (email, '@') : NULL;
+  return at && at != email && at[1] && !strchr (email, ' ') && !strchr (at + 1, '@');
+}
+
+gboolean
+smail_store_save_contact (SMailStore *s, SMailContact *c, GError **error)
+{
+  g_autofree char *email = g_strstrip (g_strdup (c->email ? c->email : ""));
+  if (!valid_address (email)) {
+    g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "Enter a valid email address");
+    return FALSE;
+  }
+  sqlite3_stmt *st;
+  if (c->id) {
+    st = prepare (s, "UPDATE contacts SET name=?, email=?, phone=?, notes=?, favorite=?, collected=? WHERE id=?");
+    sqlite3_bind_int64 (st, 7, c->id);
+  } else {
+    /* adding an address that was only collected turns it into a real contact */
+    st = prepare (s, "INSERT INTO contacts(name, email, phone, notes, favorite, collected) VALUES(?,?,?,?,?,?) "
+                     "ON CONFLICT(email) DO UPDATE SET name = excluded.name, phone = excluded.phone, "
+                     "notes = excluded.notes, favorite = excluded.favorite, collected = excluded.collected");
+  }
+  bind_text (st, 1, c->name && *c->name ? c->name : NULL);
+  bind_text (st, 2, email);
+  bind_text (st, 3, c->phone && *c->phone ? c->phone : NULL);
+  bind_text (st, 4, c->notes && *c->notes ? c->notes : NULL);
+  sqlite3_bind_int (st, 5, c->favorite);
+  sqlite3_bind_int (st, 6, c->collected);
+  int rc = sqlite3_step (st);
+  sqlite3_finalize (st);
+  if (rc != SQLITE_DONE) {
+    if (rc == SQLITE_CONSTRAINT)
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_EXISTS, "Another contact already uses %s", email);
+    else
+      set_sql_error (s, error);
+    return FALSE;
+  }
+  if (!c->id) {
+    SMailContact *saved = smail_store_find_contact (s, email);
+    c->id = saved ? saved->id : 0;
+    smail_contact_free (saved);
+  }
+  return TRUE;
+}
+
+gboolean
+smail_store_delete_contact (SMailStore *s, gint64 id, GError **error)
+{
+  sqlite3_stmt *st = prepare (s, "DELETE FROM contacts WHERE id = ?");
+  sqlite3_bind_int64 (st, 1, id);
+  return step_done (s, st, error);
+}
+
+void
+smail_store_collect_address (SMailStore *s, const char *name, const char *email, gboolean outgoing)
+{
+  if (!valid_address (email))
+    return;
+  gint64 now = g_get_real_time () / G_USEC_PER_SEC;
+  sqlite3_stmt *st = prepare (s,
+    "INSERT INTO contacts(name, email, collected, use_count, last_used) VALUES(?1, ?2, 1, ?3, ?4) "
+    "ON CONFLICT(email) DO UPDATE SET name = IFNULL(contacts.name, excluded.name), "
+    "use_count = contacts.use_count + ?3, last_used = MAX(contacts.last_used, ?4)");
+  bind_text (st, 1, name && *name ? name : NULL);
+  bind_text (st, 2, email);
+  sqlite3_bind_int (st, 3, outgoing ? 1 : 0);
+  sqlite3_bind_int64 (st, 4, now);
+  step_done (s, st, NULL);
+}
+
+gboolean
+smail_store_is_trusted_sender (SMailStore *s, const char *email)
+{
+  if (!email)
+    return FALSE;
+  sqlite3_stmt *st = prepare (s, "SELECT 1 FROM contacts WHERE email = ? AND (collected = 0 OR use_count > 0)");
+  bind_text (st, 1, email);
+  gboolean yes = sqlite3_step (st) == SQLITE_ROW;
+  sqlite3_finalize (st);
+  return yes;
 }

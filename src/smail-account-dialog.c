@@ -12,6 +12,7 @@ typedef struct {
   GtkWidget *name, *email, *password;
   GtkWidget *imap_host, *imap_port, *imap_security, *username;
   GtkWidget *smtp_host, *smtp_port, *smtp_security;
+  GtkWidget *signature;
 
   char *existing_id;
   char *auto_imap, *auto_smtp, *auto_user; /* last values we filled in automatically */
@@ -183,6 +184,12 @@ on_save (GtkButton *button, Form *f)
   a->smtp_host = stripped (f->smtp_host);
   a->smtp_port = (guint) adw_spin_row_get_value (ADW_SPIN_ROW (f->smtp_port));
   a->smtp_security = adw_combo_row_get_selected (ADW_COMBO_ROW (f->smtp_security));
+  {
+    GtkTextBuffer *buf = gtk_text_view_get_buffer (GTK_TEXT_VIEW (f->signature));
+    GtkTextIter s0, s1;
+    gtk_text_buffer_get_bounds (buf, &s0, &s1);
+    a->signature = g_strstrip (gtk_text_buffer_get_text (buf, &s0, &s1, FALSE));
+  }
   if (!*a->username) {
     g_free (a->username);
     a->username = g_strdup (a->email);
@@ -322,6 +329,27 @@ smail_account_dialog_present (GtkWidget *parent, const SMailAccount *existing,
   f->smtp_security = security_row (out, existing ? existing->smtp_security : SMAIL_SECURITY_SSL, f->smtp_port, TRUE);
   adw_preferences_group_add (out, f->smtp_port);
   adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), out);
+
+  /* signature */
+  AdwPreferencesGroup *sig = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
+  adw_preferences_group_set_title (sig, "Signature");
+  adw_preferences_group_set_description (sig, "Added to the end of new messages, replies and forwards.");
+  f->signature = gtk_text_view_new ();
+  gtk_text_view_set_wrap_mode (GTK_TEXT_VIEW (f->signature), GTK_WRAP_WORD_CHAR);
+  gtk_text_view_set_top_margin (GTK_TEXT_VIEW (f->signature), 10);
+  gtk_text_view_set_bottom_margin (GTK_TEXT_VIEW (f->signature), 10);
+  gtk_text_view_set_left_margin (GTK_TEXT_VIEW (f->signature), 12);
+  gtk_text_view_set_right_margin (GTK_TEXT_VIEW (f->signature), 12);
+  gtk_accessible_update_property (GTK_ACCESSIBLE (f->signature), GTK_ACCESSIBLE_PROPERTY_LABEL, "Signature", -1);
+  if (existing && existing->signature)
+    gtk_text_buffer_set_text (gtk_text_view_get_buffer (GTK_TEXT_VIEW (f->signature)), existing->signature, -1);
+  gtk_widget_set_size_request (f->signature, -1, 90);
+  GtkWidget *frame = gtk_frame_new (NULL);
+  gtk_widget_add_css_class (frame, "card");
+  gtk_widget_add_css_class (frame, "signature-editor");
+  gtk_frame_set_child (GTK_FRAME (frame), f->signature);
+  adw_preferences_group_add (sig, frame);
+  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), sig);
 
   if (existing) {
     /* existing values count as "user edited": don't autofill over them */

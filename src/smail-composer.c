@@ -1,6 +1,7 @@
 /* smail-composer.c — compose and send plain-text mail with attachments */
 #include "smail-composer.h"
 #include "smail-util.h"
+#include "smail-address-completion.h"
 
 #include "smail-gmime.h"
 #include <string.h>
@@ -33,11 +34,18 @@ struct _SMailComposer {
   gboolean        sending;
   gboolean        force_close;
   GBytes         *outgoing;    /* the message being sent */
+
+  SMailStore     *store;       /* address book, may be NULL */
+  char           *message_id;  /* stable across draft saves and the final send */
+  gboolean        has_draft;   /* a copy of this message is in the Drafts folder */
+  gboolean        saving;
+  gboolean        close_after_save;
+  GtkWidget      *draft_button;
 };
 
 G_DEFINE_FINAL_TYPE (SMailComposer, smail_composer, ADW_TYPE_WINDOW)
 
-enum { SIGNAL_SENT, N_SIGNALS };
+enum { SIGNAL_SENT, SIGNAL_DRAFT_SAVED, N_SIGNALS };
 static guint signals[N_SIGNALS];
 
 static void
@@ -186,7 +194,7 @@ parse_addresses (const char *text, GPtrArray *rcpts, gboolean *ok)
 }
 
 static GBytes *
-build_message (SMailComposer *self, GPtrArray *rcpts, GError **error)
+build_message (SMailComposer *self, GPtrArray *rcpts, gboolean draft, GError **error)
 {
   const SMailAccount *account = smail_backend_get_account (self->backend);
   g_autofree char *to = entry_text (self->to_entry);
@@ -198,12 +206,12 @@ build_message (SMailComposer *self, GPtrArray *rcpts, GError **error)
   g_autoptr (InternetAddressList) to_list = parse_addresses (to, rcpts, &ok_to);
   g_autoptr (InternetAddressList) cc_list = parse_addresses (cc, rcpts, &ok_cc);
   g_autoptr (InternetAddressList) bcc_list = parse_addresses (bcc, rcpts, &ok_bcc); /* envelope only */
-  if (!ok_to || !ok_cc || !ok_bcc) {
+  if (!draft && (!ok_to || !ok_cc || !ok_bcc)) {
     g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
                  "One of the recipient addresses is not valid. Separate addresses with commas.");
     return NULL;
   }
-  if (rcpts->len == 0) {
+  if (!draft && rcpts->len == 0) {
     g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "Add at least one recipient.");
     return NULL;
   }
@@ -214,13 +222,16 @@ build_message (SMailComposer *self, GPtrArray *rcpts, GError **error)
     internet_address_list_append (g_mime_message_get_addresses (msg, GMIME_ADDRESS_TYPE_TO), to_list);
   if (cc_list)
     internet_address_list_append (g_mime_message_get_addresses (msg, GMIME_ADDRESS_TYPE_CC), cc_list);
+  if (draft && bcc_list) /* drafts remember Bcc; sent mail never shows it */
+    internet_address_list_append (g_mime_message_get_addresses (msg, GMIME_ADDRESS_TYPE_BCC), bcc_list);
   g_mime_message_set_subject (msg, subject, "utf-8");
 
   g_autoptr (GDateTime) now = g_date_time_new_now_local ();
   g_mime_message_set_date (msg, now);
   const char *at = account->email ? strchr (account->email, '@') : NULL;
-  g_autofree char *msgid = g_mime_utils_generate_message_id (at ? at + 1 : "smail.local");
-  g_mime_message_set_message_id (msg, msgid);
+  if (!self->message_id)
+    self->message_id = g_mime_utils_generate_message_id (at ? at + 1 : "smail.local");
+  g_mime_message_set_message_id (msg, self->message_id);
   if (self->in_reply_to)
     g_mime_object_set_header (GMIME_OBJECT (msg), "In-Reply-To", self->in_reply_to, NULL);
   if (self->references)
@@ -295,6 +306,9 @@ on_sent (GObject *source, GAsyncResult *res, gpointer data)
     return;
   }
   g_signal_emit (self, signals[SIGNAL_SENT], 0, self->outgoing);
+  const SMailFolder *drafts = smail_backend_find_role (self->backend, "drafts");
+  if (self->has_draft && drafts && self->message_id)
+    smail_backend_save_draft (self->backend, drafts->path, self->message_id, NULL, NULL, NULL, NULL);
   self->force_close = TRUE;
   gtk_window_close (GTK_WINDOW (self));
 }
@@ -306,7 +320,7 @@ send_message (SMailComposer *self)
     return;
   g_autoptr (GPtrArray) rcpts = g_ptr_array_new_with_free_func (g_free);
   g_autoptr (GError) error = NULL;
-  g_autoptr (GBytes) message = build_message (self, rcpts, &error);
+  g_autoptr (GBytes) message = build_message (self, rcpts, FALSE, &error);
   if (!message) {
     show_error (self, "Can't Send Message", error->message);
     return;
@@ -331,6 +345,69 @@ send_action (GtkWidget *widget, const char *name, GVariant *param)
   send_message (SMAIL_COMPOSER (widget));
 }
 
+/* ---------------- drafts ---------------- */
+
+static void
+toast (SMailComposer *self, const char *text)
+{
+  adw_toast_overlay_add_toast (ADW_TOAST_OVERLAY (self->toast_overlay), adw_toast_new (text));
+}
+
+static void
+on_draft_saved (GObject *source, GAsyncResult *res, gpointer data)
+{
+  g_autoptr (SMailComposer) self = data;
+  g_autoptr (GError) error = NULL;
+  self->saving = FALSE;
+  gtk_widget_set_sensitive (self->draft_button, TRUE);
+  if (!smail_backend_finish_boolean (SMAIL_BACKEND (source), res, &error)) {
+    self->close_after_save = FALSE;
+    show_error (self, "Draft Not Saved", error->message);
+    return;
+  }
+  self->has_draft = TRUE;
+  self->dirty = FALSE;
+  g_signal_emit (self, signals[SIGNAL_DRAFT_SAVED], 0);
+  if (self->close_after_save) {
+    self->force_close = TRUE;
+    gtk_window_close (GTK_WINDOW (self));
+  } else {
+    toast (self, "Draft saved");
+  }
+}
+
+static void
+save_draft (SMailComposer *self)
+{
+  if (self->saving || self->sending)
+    return;
+  const SMailFolder *drafts = smail_backend_find_role (self->backend, "drafts");
+  if (!drafts) {
+    self->close_after_save = FALSE;
+    show_error (self, "Draft Not Saved", "This account has no Drafts folder.");
+    return;
+  }
+  g_autoptr (GPtrArray) rcpts = g_ptr_array_new_with_free_func (g_free);
+  g_autoptr (GBytes) message = build_message (self, rcpts, TRUE, NULL);
+  self->saving = TRUE;
+  gtk_widget_set_sensitive (self->draft_button, FALSE);
+  /* replaces the previous copy of this draft (same Message-ID) */
+  smail_backend_save_draft (self->backend, drafts->path, self->message_id, message, "\\Draft \\Seen",
+                            on_draft_saved, g_object_ref (self));
+}
+
+static void
+on_save_draft_clicked (GtkButton *b, SMailComposer *self)
+{
+  save_draft (self);
+}
+
+static void
+save_draft_action (GtkWidget *widget, const char *name, GVariant *param)
+{
+  save_draft (SMAIL_COMPOSER (widget));
+}
+
 /* ---------------- closing ---------------- */
 
 static void
@@ -339,6 +416,9 @@ on_discard_response (AdwAlertDialog *dialog, const char *response, SMailComposer
   if (g_str_equal (response, "discard")) {
     self->force_close = TRUE;
     gtk_window_close (GTK_WINDOW (self));
+  } else if (g_str_equal (response, "save")) {
+    self->close_after_save = TRUE;
+    save_draft (self);
   }
 }
 
@@ -348,13 +428,20 @@ smail_composer_close_request (GtkWindow *window)
   SMailComposer *self = SMAIL_COMPOSER (window);
   if (self->force_close || !self->dirty)
     return GTK_WINDOW_CLASS (smail_composer_parent_class)->close_request (window);
-  if (self->sending)
+  if (self->sending || self->saving)
     return TRUE;
 
-  AdwDialog *alert = adw_alert_dialog_new ("Discard Message?", "The message you wrote will be lost.");
+  gboolean can_save = smail_backend_find_role (self->backend, "drafts") != NULL;
+  AdwDialog *alert = adw_alert_dialog_new ("Save Draft?",
+                                           can_save ? "Save this message to Drafts to finish it later?"
+                                                    : "The message you wrote will be lost.");
   adw_alert_dialog_add_responses (ADW_ALERT_DIALOG (alert), "cancel", "_Keep Editing", "discard", "_Discard", NULL);
+  if (can_save) {
+    adw_alert_dialog_add_response (ADW_ALERT_DIALOG (alert), "save", "_Save Draft");
+    adw_alert_dialog_set_response_appearance (ADW_ALERT_DIALOG (alert), "save", ADW_RESPONSE_SUGGESTED);
+  }
   adw_alert_dialog_set_response_appearance (ADW_ALERT_DIALOG (alert), "discard", ADW_RESPONSE_DESTRUCTIVE);
-  adw_alert_dialog_set_default_response (ADW_ALERT_DIALOG (alert), "cancel");
+  adw_alert_dialog_set_default_response (ADW_ALERT_DIALOG (alert), can_save ? "save" : "cancel");
   adw_alert_dialog_set_close_response (ADW_ALERT_DIALOG (alert), "cancel");
   g_signal_connect (alert, "response", G_CALLBACK (on_discard_response), self);
   adw_dialog_present (alert, GTK_WIDGET (self));
@@ -375,6 +462,7 @@ smail_composer_finalize (GObject *object)
   SMailComposer *self = SMAIL_COMPOSER (object);
   g_clear_object (&self->backend);
   g_clear_pointer (&self->outgoing, g_bytes_unref);
+  g_free (self->message_id);
   g_ptr_array_unref (self->attachments);
   g_free (self->in_reply_to);
   g_free (self->references);
@@ -388,6 +476,10 @@ smail_composer_class_init (SMailComposerClass *klass)
   G_OBJECT_CLASS (klass)->finalize = smail_composer_finalize;
   GTK_WINDOW_CLASS (klass)->close_request = smail_composer_close_request;
 
+  signals[SIGNAL_DRAFT_SAVED] = g_signal_new ("draft-saved", G_TYPE_FROM_CLASS (klass), G_SIGNAL_RUN_LAST,
+                                              0, NULL, NULL, NULL, G_TYPE_NONE, 0);
+  gtk_widget_class_install_action (wc, "composer.save-draft", NULL, save_draft_action);
+  gtk_widget_class_add_binding_action (wc, GDK_KEY_s, GDK_CONTROL_MASK, "composer.save-draft", NULL);
   /* "sent" (GBytes *message): the complete message as it was handed to the server */
   signals[SIGNAL_SENT] = g_signal_new ("sent", G_TYPE_FROM_CLASS (klass), G_SIGNAL_RUN_LAST,
                                        0, NULL, NULL, NULL, G_TYPE_NONE, 1, G_TYPE_BYTES);
@@ -434,6 +526,10 @@ smail_composer_init (SMailComposer *self)
   gtk_widget_set_tooltip_text (attach, "Attach Files");
   g_signal_connect (attach, "clicked", G_CALLBACK (on_attach_clicked), self);
   adw_header_bar_pack_start (ADW_HEADER_BAR (header), attach);
+  self->draft_button = gtk_button_new_from_icon_name ("document-save-symbolic");
+  gtk_widget_set_tooltip_text (self->draft_button, "Save Draft (Ctrl+S)");
+  g_signal_connect (self->draft_button, "clicked", G_CALLBACK (on_save_draft_clicked), self);
+  adw_header_bar_pack_start (ADW_HEADER_BAR (header), self->draft_button);
 
   self->send_button = gtk_button_new ();
   GtkWidget *content = adw_button_content_new ();
@@ -484,7 +580,9 @@ smail_composer_init (SMailComposer *self)
   gtk_widget_set_vexpand (scroll, TRUE);
   gtk_box_append (GTK_BOX (box), scroll);
 
-  adw_toolbar_view_set_content (ADW_TOOLBAR_VIEW (toolbar), box);
+  self->toast_overlay = adw_toast_overlay_new ();
+  adw_toast_overlay_set_child (ADW_TOAST_OVERLAY (self->toast_overlay), box);
+  adw_toolbar_view_set_content (ADW_TOOLBAR_VIEW (toolbar), self->toast_overlay);
   adw_window_set_content (ADW_WINDOW (self), toolbar);
 
   /* Ctrl+Enter must win over the text view's own Return handling */
@@ -498,6 +596,8 @@ smail_composer_init (SMailComposer *self)
 
   g_signal_connect_swapped (self->to_entry, "changed", G_CALLBACK (mark_dirty), self);
   g_signal_connect_swapped (self->subject_entry, "changed", G_CALLBACK (mark_dirty), self);
+  g_signal_connect_swapped (self->cc_entry, "changed", G_CALLBACK (mark_dirty), self);
+  g_signal_connect_swapped (self->bcc_entry, "changed", G_CALLBACK (mark_dirty), self);
   g_signal_connect_swapped (gtk_text_view_get_buffer (GTK_TEXT_VIEW (self->text_view)), "changed",
                             G_CALLBACK (mark_dirty), self);
 }
@@ -533,14 +633,53 @@ merge_addresses (GString *dst, const char *src, const char *self_addr, GHashTabl
   }
 }
 
+/* "\n\n-- \nsignature", or "" */
+static char *
+signature_block (const SMailAccount *account)
+{
+  if (!account->signature || !*account->signature)
+    return g_strdup ("");
+  return g_strdup_printf ("\n\n-- \n%s", account->signature);
+}
+
+static void
+prefill_draft (SMailComposer *self, const SMailMessageDetail *d)
+{
+  GtkTextBuffer *buffer = gtk_text_view_get_buffer (GTK_TEXT_VIEW (self->text_view));
+  gtk_editable_set_text (GTK_EDITABLE (self->to_entry), d->to ? d->to : "");
+  gtk_editable_set_text (GTK_EDITABLE (self->cc_entry), d->cc ? d->cc : "");
+  gtk_editable_set_text (GTK_EDITABLE (self->bcc_entry), d->bcc ? d->bcc : "");
+  if (d->cc || d->bcc)
+    gtk_revealer_set_reveal_child (GTK_REVEALER (self->cc_revealer), TRUE);
+  gtk_editable_set_text (GTK_EDITABLE (self->subject_entry),
+                         g_strcmp0 (d->subject, "(No Subject)") == 0 ? "" : d->subject);
+  g_autofree char *text = d->text ? g_strdup (d->text) : smail_html_to_text (d->html ? d->html : "");
+  gtk_text_buffer_set_text (buffer, text, -1);
+  for (guint i = 0; i < d->attachments->len; i++) {
+    SMailAttachment *a = g_ptr_array_index (d->attachments, i);
+    add_attachment (self, a->filename, a->content_type, a->data);
+  }
+  rebuild_attachments (self);
+  self->in_reply_to = g_strdup (d->in_reply_to);
+  self->references = g_strdup (d->references);
+  /* keep the draft's Message-ID so saving or sending replaces this draft */
+  self->message_id = g_strdup (d->message_id);
+  self->has_draft = d->message_id != NULL;
+  gtk_widget_grab_focus (d->to ? self->text_view : self->to_entry);
+}
+
 static void
 prefill (SMailComposer *self, SMailComposeMode mode, const SMailMessageDetail *orig)
 {
   const SMailAccount *account = smail_backend_get_account (self->backend);
   GtkTextBuffer *buffer = gtk_text_view_get_buffer (GTK_TEXT_VIEW (self->text_view));
   const char *title = "New Message";
+  g_autofree char *sig = signature_block (account);
 
-  if (orig && mode != SMAIL_COMPOSE_NEW) {
+  if (orig && mode == SMAIL_COMPOSE_DRAFT) {
+    title = "Edit Draft";
+    prefill_draft (self, orig);
+  } else if (orig && mode != SMAIL_COMPOSE_NEW) {
     g_autofree char *text = orig->text ? g_strdup (orig->text)
                                        : smail_html_to_text (orig->html ? orig->html : "");
     g_autofree char *date = smail_format_date_long (orig->date);
@@ -553,9 +692,9 @@ prefill (SMailComposer *self, SMailComposeMode mode, const SMailMessageDetail *o
       g_autofree char *subject = has_prefix_ci (orig->subject, "fwd:") ? g_strdup (orig->subject)
                                                                        : g_strdup_printf ("Fwd: %s", orig->subject);
       gtk_editable_set_text (GTK_EDITABLE (self->subject_entry), subject);
-      g_autofree char *body = g_strdup_printf ("\n\n---------- Forwarded message ----------\n"
+      g_autofree char *body = g_strdup_printf ("%s\n\n---------- Forwarded message ----------\n"
                                                "From: %s\nDate: %s\nSubject: %s\nTo: %s\n\n%s",
-                                               sender, date, orig->subject, orig->to ? orig->to : "", text);
+                                               sig, sender, date, orig->subject, orig->to ? orig->to : "", text);
       gtk_text_buffer_set_text (buffer, body, -1);
       for (guint i = 0; i < orig->attachments->len; i++) {
         SMailAttachment *a = g_ptr_array_index (orig->attachments, i);
@@ -584,7 +723,7 @@ prefill (SMailComposer *self, SMailComposeMode mode, const SMailMessageDetail *o
       gtk_editable_set_text (GTK_EDITABLE (self->subject_entry), subject);
 
       g_autofree char *quoted = smail_quote_text (text);
-      g_autofree char *body = g_strdup_printf ("\n\nOn %s, %s wrote:\n%s", date, sender, quoted);
+      g_autofree char *body = g_strdup_printf ("%s\n\nOn %s, %s wrote:\n%s", sig, date, sender, quoted);
       gtk_text_buffer_set_text (buffer, body, -1);
       GtkTextIter start;
       gtk_text_buffer_get_start_iter (buffer, &start);
@@ -598,6 +737,12 @@ prefill (SMailComposer *self, SMailComposeMode mode, const SMailMessageDetail *o
       }
     }
   } else {
+    if (*sig) {
+      gtk_text_buffer_set_text (buffer, sig, -1);
+      GtkTextIter start;
+      gtk_text_buffer_get_start_iter (buffer, &start);
+      gtk_text_buffer_place_cursor (buffer, &start);
+    }
     gtk_widget_grab_focus (self->to_entry);
   }
 
@@ -606,6 +751,26 @@ prefill (SMailComposer *self, SMailComposeMode mode, const SMailMessageDetail *o
   adw_window_title_set_subtitle (ADW_WINDOW_TITLE (self->title), from);
   gtk_window_set_title (GTK_WINDOW (self), title);
   self->dirty = FALSE; /* prefilled content is not "user work" yet */
+}
+
+void
+smail_composer_set_address_book (SMailComposer *self, SMailStore *store)
+{
+  if (self->store || !store)
+    return;
+  self->store = store;
+  smail_address_completion_attach (self->to_entry, store);
+  smail_address_completion_attach (self->cc_entry, store);
+  smail_address_completion_attach (self->bcc_entry, store);
+}
+
+void
+smail_composer_set_to (SMailComposer *self, const char *to)
+{
+  gtk_editable_set_text (GTK_EDITABLE (self->to_entry), to ? to : "");
+  gtk_editable_set_position (GTK_EDITABLE (self->to_entry), -1);
+  gtk_widget_grab_focus (self->subject_entry);
+  self->dirty = FALSE;
 }
 
 SMailBackend *

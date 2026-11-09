@@ -74,6 +74,20 @@ typedef struct {
   gint64   ts;
 } SMailChatMessage;
 
+typedef struct {
+  gint64   id;
+  char    *name;
+  char    *email;
+  char    *phone;
+  char    *notes;
+  gboolean favorite;
+  gboolean collected;   /* added automatically from mail, not by you */
+  gint64   use_count;   /* how often you wrote to them */
+  gint64   last_used;
+} SMailContact;
+
+void smail_contact_free    (SMailContact *c);
+SMailContact *smail_contact_copy (const SMailContact *c);
 void smail_event_free      (SMailEvent *e);
 void smail_todo_free       (SMailTodo *t);
 void smail_reminder_free   (SMailReminder *r);
@@ -132,6 +146,17 @@ gboolean   smail_store_save_message  (SMailStore *s, const char *account, const 
                                       GBytes *raw, char **path_out, GError **error);
 GBytes    *smail_store_load_message  (SMailStore *s, const char *account, const char *folder, const char *uid);
 void       smail_store_message_stats (SMailStore *s, gint64 *count, gint64 *bytes);
+
+/* Address book. Searching matches name or address, best matches first. */
+GPtrArray *smail_store_list_contacts  (SMailStore *s, const char *query, int limit);  /* SMailContact* */
+SMailContact *smail_store_find_contact (SMailStore *s, const char *email);
+gboolean   smail_store_save_contact   (SMailStore *s, SMailContact *c, GError **error);
+gboolean   smail_store_delete_contact (SMailStore *s, gint64 id, GError **error);
+/* Remember an address seen in mail (like Thunderbird's "Collected Addresses").
+ * `outgoing`: you wrote to them, which ranks them higher in autocomplete. */
+void       smail_store_collect_address (SMailStore *s, const char *name, const char *email, gboolean outgoing);
+/* People you added yourself or have written to. */
+gboolean   smail_store_is_trusted_sender (SMailStore *s, const char *email);
 
 /* LAN chat history */
 gboolean   smail_store_add_chat_message (SMailStore *s, SMailChatMessage *m, GError **error);

@@ -316,6 +316,27 @@ demo_search (SMailBackend *backend, const char *folder, const char *query, guint
   return out;
 }
 
+static int
+demo_delete_by_message_id (SMailBackend *backend, const char *folder, const char *message_id, GError **error)
+{
+  SMailDemoBackend *self = SMAIL_DEMO_BACKEND (backend);
+  GPtrArray *msgs = folder_messages (self, folder);
+  g_autofree char *want = g_strdup (message_id[0] == '<' ? message_id + 1 : message_id);
+  char *gt = strchr (want, '>');
+  if (gt)
+    *gt = '\0';
+  int n = 0;
+  for (gint i = msgs->len - 1; i >= 0; i--) {
+    DemoMessage *m = g_ptr_array_index (msgs, i);
+    g_autoptr (SMailMessageDetail) d = smail_message_detail_parse ("", m->raw, NULL);
+    if (d && g_strcmp0 (d->message_id, want) == 0) {
+      g_ptr_array_remove_index (msgs, i);
+      n++;
+    }
+  }
+  return n;
+}
+
 static gboolean
 demo_create_folder (SMailBackend *backend, const char *name, GError **error)
 {
@@ -403,6 +424,7 @@ smail_demo_backend_class_init (SMailDemoBackendClass *klass)
   bc->create_folder = demo_create_folder;
   bc->rename_folder = demo_rename_folder;
   bc->delete_folder = demo_delete_folder;
+  bc->delete_by_message_id = demo_delete_by_message_id;
   bc->send = demo_send;
 }
 

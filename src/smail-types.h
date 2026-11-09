@@ -25,6 +25,7 @@ typedef struct {
   char *smtp_host;
   guint smtp_port;
   SMailSecurity smtp_security;
+  char *signature;           /* plain text, may be NULL */
 } SMailAccount;
 
 SMailAccount *smail_account_new  (void);
@@ -94,6 +95,8 @@ typedef struct {
   GDateTime *date;
   char      *message_id;
   char      *references;
+  char      *in_reply_to;
+  char      *bcc;         /* only present in drafts */
   char      *html;
   char      *text;
   GPtrArray *attachments; /* SMailAttachment*, real attachments            */

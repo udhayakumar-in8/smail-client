@@ -21,6 +21,7 @@ typedef struct {
   gint64 reminders;
   gint64 log_entries;
   gint64 chat_messages;
+  gint64 contacts;
   gint64 emails;       /* stored .eml files */
   gint64 bytes;        /* size of the stored files */
   gboolean passwords;

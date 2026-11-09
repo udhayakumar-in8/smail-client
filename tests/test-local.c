@@ -2,6 +2,8 @@
 #include "smail-store.h"
 #include "smail-automation.h"
 #include "smail-lan.h"
+#include "smail-vcard.h"
+#include "smail-mbox.h"
 #include "smail-gmime.h"
 
 #include <glib/gstdio.h>
@@ -242,6 +244,177 @@ test_mail_log (void)
   smail_store_close (s);
 }
 
+/* ---------------- contacts ---------------- */
+
+static void
+test_contacts (void)
+{
+  SMailStore *s = open_memory ();
+  g_autoptr (GError) error = NULL;
+
+  /* collected addresses: outgoing ones rank first, names fill in once */
+  smail_store_collect_address (s, NULL, "newsletter@shop.example", FALSE);
+  smail_store_collect_address (s, "Priya Raman", "priya@example.org", TRUE);
+  smail_store_collect_address (s, "Priya R.", "PRIYA@example.org", TRUE);   /* same address, any case */
+  smail_store_collect_address (s, "Bad", "not-an-address", TRUE);
+  g_autoptr (GPtrArray) all = smail_store_list_contacts (s, NULL, 50);
+  g_assert_cmpuint (all->len, ==, 2);
+  SMailContact *first = g_ptr_array_index (all, 0);
+  g_assert_cmpstr (first->email, ==, "priya@example.org");
+  g_assert_cmpstr (first->name, ==, "Priya Raman");
+  g_assert_cmpint (first->use_count, ==, 2);
+  g_assert_true (first->collected);
+  g_assert_true (smail_store_is_trusted_sender (s, "priya@example.org"));
+  g_assert_false (smail_store_is_trusted_sender (s, "newsletter@shop.example"));
+
+  /* adding a contact by hand */
+  SMailContact c = { 0, "Ada Lovelace", " ada@example.org ", "+44 20 7946 0000", "Analytical engine", TRUE };
+  g_assert_true (smail_store_save_contact (s, &c, &error));
+  g_assert_no_error (error);
+  g_assert_cmpint (c.id, >, 0);
+  g_assert_true (smail_store_is_trusted_sender (s, "ada@example.org"));
+  SMailContact bad = { 0, "x", "nope", NULL, NULL, FALSE };
+  g_assert_false (smail_store_save_contact (s, &bad, &error));
+  g_clear_error (&error);
+
+  /* promoting a collected address keeps one entry */
+  SMailContact promote = { 0, "Shop News", "newsletter@shop.example", NULL, NULL, FALSE };
+  g_assert_true (smail_store_save_contact (s, &promote, &error));
+  g_autoptr (GPtrArray) after = smail_store_list_contacts (s, NULL, 50);
+  g_assert_cmpuint (after->len, ==, 3);
+
+  /* search: word prefix beats substring, favorites and real contacts first */
+  g_autoptr (GPtrArray) q = smail_store_list_contacts (s, "lov", 10);
+  g_assert_cmpuint (q->len, ==, 1);
+  g_assert_cmpstr (((SMailContact *) g_ptr_array_index (q, 0))->email, ==, "ada@example.org");
+  g_autoptr (GPtrArray) q2 = smail_store_list_contacts (s, "example.org", 10);
+  g_assert_cmpuint (q2->len, ==, 2);
+  g_assert_cmpstr (((SMailContact *) g_ptr_array_index (q2, 0))->email, ==, "ada@example.org");
+
+  /* vCard round trip */
+  g_autofree char *vcf = smail_contacts_to_vcard (after);
+  g_assert_nonnull (strstr (vcf, "FN:Ada Lovelace"));
+  g_assert_nonnull (strstr (vcf, "N:Lovelace;Ada;;;"));
+  g_autoptr (GPtrArray) back = smail_contacts_parse (vcf, strlen (vcf), &error);
+  g_assert_no_error (error);
+  g_assert_cmpuint (back->len, ==, 3);
+  gboolean saw_ada = FALSE;
+  for (guint i = 0; i < back->len; i++) {
+    SMailContact *b = g_ptr_array_index (back, i);
+    if (g_str_equal (b->email, "ada@example.org")) {
+      saw_ada = TRUE;
+      g_assert_cmpstr (b->name, ==, "Ada Lovelace");
+      g_assert_cmpstr (b->phone, ==, "+44 20 7946 0000");
+      g_assert_true (b->favorite);
+    }
+  }
+  g_assert_true (saw_ada);
+
+  g_assert_true (smail_store_delete_contact (s, c.id, &error));
+  smail_store_close (s);
+}
+
+static void
+test_contact_imports (void)
+{
+  g_autoptr (GError) error = NULL;
+
+  /* vCard 2.1 from a phone: folding, groups, quoted-printable, two addresses */
+  const char *vcf =
+    "BEGIN:VCARD\r\nVERSION:2.1\r\nN:Dupont;Ren=C3=A9e;;;\r\n"
+    "FN;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:Ren=C3=A9e Dupont\r\n"
+    "item1.EMAIL;TYPE=INTERNET:renee@exam\r\n ple.fr\r\n"
+    "EMAIL;WORK:r.dupont@work.example\r\nTEL;CELL:tel:+33 6 12 34 56 78\r\n"
+    "NOTE:Met at\\, the conference\\nParis\r\nEND:VCARD\r\n"
+    "BEGIN:VCARD\r\nVERSION:4.0\r\nN:;Solo;;;\r\nEMAIL:mailto:solo@example.com\r\nEND:VCARD\r\n"
+    "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:No Email\r\nEND:VCARD\r\n";
+  g_autoptr (GPtrArray) v = smail_contacts_parse (vcf, strlen (vcf), &error);
+  g_assert_no_error (error);
+  g_assert_cmpuint (v->len, ==, 3);
+  SMailContact *r1 = g_ptr_array_index (v, 0);
+  g_assert_cmpstr (r1->name, ==, "Renée Dupont");
+  g_assert_cmpstr (r1->email, ==, "renee@example.fr");
+  g_assert_cmpstr (r1->phone, ==, "+33 6 12 34 56 78");
+  g_assert_cmpstr (r1->notes, ==, "Met at, the conference\nParis");
+  g_assert_cmpstr (((SMailContact *) g_ptr_array_index (v, 1))->email, ==, "r.dupont@work.example");
+  SMailContact *solo = g_ptr_array_index (v, 2);
+  g_assert_cmpstr (solo->name, ==, "Solo");
+  g_assert_cmpstr (solo->email, ==, "solo@example.com");
+
+  /* Thunderbird CSV export */
+  const char *tb = "First Name,Last Name,Display Name,Nickname,Primary Email,Secondary Email,Mobile Number,Notes\r\n"
+                   "Ada,Lovelace,Ada Lovelace,,ada@example.org,ada@home.example,+44 1,\"Likes engines, maths\"\r\n"
+                   "Bob,,,,bob@example.org,,,\r\n\r\n";
+  g_autoptr (GPtrArray) t = smail_contacts_parse (tb, strlen (tb), &error);
+  g_assert_no_error (error);
+  g_assert_cmpuint (t->len, ==, 3);
+  SMailContact *a = g_ptr_array_index (t, 0);
+  g_assert_cmpstr (a->name, ==, "Ada Lovelace");
+  g_assert_cmpstr (a->notes, ==, "Likes engines, maths");
+  g_assert_cmpstr (((SMailContact *) g_ptr_array_index (t, 1))->email, ==, "ada@home.example");
+  g_assert_cmpstr (((SMailContact *) g_ptr_array_index (t, 2))->name, ==, "Bob");
+
+  /* Google CSV with a BOM and several addresses in one cell */
+  const char *gg = "\xEF\xBB\xBFName,Given Name,E-mail 1 - Type,E-mail 1 - Value,Phone 1 - Value\n"
+                   "Grace Hopper,Grace,* Work,grace@navy.example ::: grace@home.example,555\n";
+  g_autoptr (GPtrArray) g = smail_contacts_parse (gg, strlen (gg), &error);
+  g_assert_no_error (error);
+  g_assert_cmpuint (g->len, ==, 2);
+  g_assert_cmpstr (((SMailContact *) g_ptr_array_index (g, 1))->email, ==, "grace@home.example");
+
+  /* semicolon-separated (some locales) */
+  const char *semi = "Name;Email\nZoe;zoe@example.net\n";
+  g_autoptr (GPtrArray) z = smail_contacts_parse (semi, strlen (semi), &error);
+  g_assert_cmpuint (z->len, ==, 1);
+
+  /* a CSV without an email column is refused with a clear message */
+  const char *junk = "foo,bar\n1,2\n";
+  g_assert_null (smail_contacts_parse (junk, strlen (junk), &error));
+  g_assert_nonnull (strstr (error->message, "email column"));
+}
+
+/* ---------------- mbox ---------------- */
+
+static void
+test_mbox (void)
+{
+  const char *m1 = "From: a@example.org\r\nSubject: one\r\n\r\nHello\r\nFrom here on, a line that looks like a separator\r\n";
+  const char *m2 = "From: b@example.org\r\nSubject: two\r\n\r\n>From quoted already\r\nbye\r\n";
+  g_autoptr (GBytes) b1 = g_bytes_new_static (m1, strlen (m1));
+  g_autoptr (GBytes) b2 = g_bytes_new_static (m2, strlen (m2));
+
+  g_autoptr (GString) mbox = g_string_new (NULL);
+  g_autoptr (GDateTime) when = g_date_time_new_utc (2026, 11, 3, 10, 0, 0);
+  smail_mbox_append (mbox, b1, "a@example.org", when);
+  smail_mbox_append (mbox, b2, NULL, NULL);
+  g_assert_true (g_str_has_prefix (mbox->str, "From a@example.org Tue Nov  3 10:00:00 2026\n"));
+  g_assert_nonnull (strstr (mbox->str, "\n>From here on"));
+  g_assert_nonnull (strstr (mbox->str, "\n>>From quoted already"));
+  g_assert_null (strstr (mbox->str, "\r"));
+
+  /* round trip restores both messages exactly (CRLF) */
+  g_autoptr (GPtrArray) msgs = smail_mbox_split (mbox->str, mbox->len);
+  g_assert_cmpuint (msgs->len, ==, 2);
+  g_assert_true (g_bytes_equal (g_ptr_array_index (msgs, 0), b1));
+  g_assert_true (g_bytes_equal (g_ptr_array_index (msgs, 1), b2));
+
+  /* a single .eml file (no separator) is one message, LF input becomes CRLF */
+  const char *eml = "From: c@example.org\nSubject: three\n\nbody\n";
+  g_autoptr (GPtrArray) one = smail_mbox_split (eml, strlen (eml));
+  g_assert_cmpuint (one->len, ==, 1);
+  g_assert_cmpstr (g_bytes_get_data (g_ptr_array_index (one, 0), NULL), ==,
+                   "From: c@example.org\r\nSubject: three\r\n\r\nbody\r\n");
+
+  /* an mbox "From " line inside a body only counts after a blank line */
+  const char *tricky = "From x Tue Nov  3 10:00:00 2026\nSubject: a\n\nline\nFrom y in the text\n\nFrom z Tue Nov  3 10:00:00 2026\nSubject: b\n\nok\n";
+  g_autoptr (GPtrArray) two = smail_mbox_split (tricky, strlen (tricky));
+  g_assert_cmpuint (two->len, ==, 2);
+  g_assert_nonnull (strstr (g_bytes_get_data (g_ptr_array_index (two, 0), NULL), "From y in the text"));
+
+  g_autoptr (GPtrArray) none = smail_mbox_split ("", 0);
+  g_assert_cmpuint (none->len, ==, 0);
+}
+
 /* ---------------- LAN ---------------- */
 
 typedef struct {
@@ -362,6 +535,9 @@ main (int argc, char *argv[])
   g_test_add_func ("/store/todos", test_todos_and_due);
   g_test_add_func ("/filters/match", test_filters);
   g_test_add_func ("/maillog/log", test_mail_log);
+  g_test_add_func ("/contacts/store", test_contacts);
+  g_test_add_func ("/contacts/import", test_contact_imports);
+  g_test_add_func ("/mbox/round-trip", test_mbox);
   g_test_add_func ("/lan/chat", test_lan);
   int ret = g_test_run ();
   g_mime_shutdown ();

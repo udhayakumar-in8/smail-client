@@ -13,7 +13,7 @@
 
 /* tables copied as a whole, in this order */
 static const char *data_tables[] = {
-  "events", "todos", "reminders", "filters", "mail_log", "sync_state", "lan_messages", "messages", NULL
+  "events", "todos", "reminders", "filters", "mail_log", "sync_state", "lan_messages", "messages", "contacts", NULL
 };
 
 void
@@ -42,9 +42,25 @@ exec (sqlite3 *db, const char *sql, GError **error)
   return TRUE;
 }
 
+static gboolean
+table_exists (sqlite3 *db, const char *schema, const char *table)
+{
+  g_autofree char *sql = g_strdup_printf ("SELECT 1 FROM %s.sqlite_master WHERE type = 'table' AND name = ?", schema);
+  sqlite3_stmt *st = NULL;
+  gboolean yes = FALSE;
+  if (sqlite3_prepare_v2 (db, sql, -1, &st, NULL) == SQLITE_OK) {
+    sqlite3_bind_text (st, 1, table, -1, SQLITE_TRANSIENT);
+    yes = sqlite3_step (st) == SQLITE_ROW;
+  }
+  sqlite3_finalize (st);
+  return yes;
+}
+
 static gint64
 count_rows (sqlite3 *db, const char *schema, const char *table)
 {
+  if (!table_exists (db, schema, table))
+    return 0;
   g_autofree char *sql = g_strdup_printf ("SELECT COUNT(*) FROM %s.%s", schema, table);
   sqlite3_stmt *st = NULL;
   gint64 n = 0;
@@ -121,6 +137,7 @@ fill_counts (sqlite3 *db, const char *schema, SMailBackupSummary *s)
   s->reminders = count_rows (db, schema, "reminders");
   s->log_entries = count_rows (db, schema, "mail_log");
   s->chat_messages = count_rows (db, schema, "lan_messages");
+  s->contacts = count_rows (db, schema, "contacts");
 }
 
 /* ======================= create ======================= */
@@ -165,7 +182,7 @@ smail_backup_create (SMailStore *store, GPtrArray *accounts, const char *path,
                  "CREATE TABLE backup_meta (key TEXT PRIMARY KEY, value TEXT);"
                  "CREATE TABLE backup_accounts (id TEXT, name TEXT, email TEXT, username TEXT, password TEXT,"
                  "  imap_host TEXT, imap_port INTEGER, imap_security INTEGER,"
-                 "  smtp_host TEXT, smtp_port INTEGER, smtp_security INTEGER);"
+                 "  smtp_host TEXT, smtp_port INTEGER, smtp_security INTEGER, signature TEXT);"
                  "CREATE TABLE backup_files (orig_path TEXT PRIMARY KEY, rel_path TEXT NOT NULL, data BLOB NOT NULL);"
                  "BEGIN;", error))
     goto out;
@@ -173,7 +190,7 @@ smail_backup_create (SMailStore *store, GPtrArray *accounts, const char *path,
   for (guint i = 0; accounts && i < accounts->len; i++) {
     SMailAccount *a = g_ptr_array_index (accounts, i);
     sqlite3_stmt *st = NULL;
-    sqlite3_prepare_v2 (db, "INSERT INTO backup_accounts VALUES(?,?,?,?,?,?,?,?,?,?,?)", -1, &st, NULL);
+    sqlite3_prepare_v2 (db, "INSERT INTO backup_accounts VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", -1, &st, NULL);
     sqlite3_bind_text (st, 1, a->id, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text (st, 2, a->name, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text (st, 3, a->email, -1, SQLITE_TRANSIENT);
@@ -186,6 +203,7 @@ smail_backup_create (SMailStore *store, GPtrArray *accounts, const char *path,
     sqlite3_bind_text (st, 9, a->smtp_host, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int (st, 10, a->smtp_port);
     sqlite3_bind_int (st, 11, a->smtp_security);
+    sqlite3_bind_text (st, 12, a->signature, -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step (st);
     sqlite3_finalize (st);
     if (rc != SQLITE_DONE) {
@@ -326,8 +344,15 @@ smail_backup_restore (SMailStore *store, const char *path, GPtrArray **accounts_
 
   g_autoptr (GPtrArray) accounts = g_ptr_array_new_with_free_func ((GDestroyNotify) smail_account_free);
   sqlite3_stmt *st = NULL;
-  sqlite3_prepare_v2 (bdb, "SELECT id, name, email, username, password, imap_host, imap_port, imap_security,"
-                           " smtp_host, smtp_port, smtp_security FROM backup_accounts", -1, &st, NULL);
+  /* backups made before signatures existed don't have that column */
+  gboolean has_signature = sqlite3_prepare_v2 (bdb, "SELECT id, name, email, username, password, imap_host,"
+                                               " imap_port, imap_security, smtp_host, smtp_port, smtp_security,"
+                                               " signature FROM backup_accounts", -1, &st, NULL) == SQLITE_OK;
+  if (!has_signature) {
+    sqlite3_finalize (st);
+    sqlite3_prepare_v2 (bdb, "SELECT id, name, email, username, password, imap_host, imap_port, imap_security,"
+                             " smtp_host, smtp_port, smtp_security FROM backup_accounts", -1, &st, NULL);
+  }
   while (sqlite3_step (st) == SQLITE_ROW) {
     SMailAccount *a = smail_account_new ();
     a->id = col_dup (st, 0);
@@ -341,6 +366,8 @@ smail_backup_restore (SMailStore *store, const char *path, GPtrArray **accounts_
     a->smtp_host = col_dup (st, 8);
     a->smtp_port = sqlite3_column_int (st, 9);
     a->smtp_security = sqlite3_column_int (st, 10);
+    if (has_signature)
+      a->signature = col_dup (st, 11);
     g_ptr_array_add (accounts, a);
   }
   sqlite3_finalize (st);
@@ -377,6 +404,9 @@ smail_backup_restore (SMailStore *store, const char *path, GPtrArray **accounts_
     return FALSE;
   gboolean ok = exec (db, "BEGIN IMMEDIATE;", error);
   for (int i = 0; ok && data_tables[i]; i++) {
+    /* backups from older versions may not have every table: keep ours then */
+    if (!table_exists (db, "b", data_tables[i]))
+      continue;
     g_autofree char *sql = g_strdup_printf ("DELETE FROM main.%s; INSERT INTO main.%s SELECT * FROM b.%s;",
                                             data_tables[i], data_tables[i], data_tables[i]);
     ok = exec (db, sql, error);
