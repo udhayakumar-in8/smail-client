@@ -15,15 +15,19 @@
 #include "smail-ui.h"
 #include "smail-theme.h"
 #include "smail-backup-dialog.h"
+#include "smail-contacts-page.h"
+#include "smail-mbox.h"
+#include "smail-gmime.h"
 
 #include <string.h>
 
 #define MESSAGE_LIMIT        100
-#define AUTO_REFRESH_SECONDS (5 * 60)
+#define LOAD_MORE_STEP       100
 #define REMINDER_CHECK_SECONDS 15
 
 /* Organizer pages shown in place of the mail panes */
 static const struct { const char *id, *title, *icon; } tools[] = {
+  { "contacts",  "Address Book", "x-office-address-book-symbolic" },
   { "calendar",  "Calendar",   "x-office-calendar-symbolic" },
   { "tasks",     "Tasks",      "checkbox-checked-symbolic" },
   { "reminders", "Reminders",  "alarm-symbolic" },
@@ -94,6 +98,21 @@ struct _SMailWindow {
   int             chat_unread;
   guint           reminder_source;
   gboolean        skip_welcome;
+
+  /* Thunderbird-style mail tools */
+  GtkWidget      *contacts_page;
+  GtkWidget      *edit_draft_button;
+  GtkWidget      *load_more;
+  GtkWidget      *message_menu;   /* right-click on a message */
+  GtkWidget      *folder_menu;    /* right-click on a folder */
+  GMenu          *move_menu;      /* "Move To" submenu: the current account's folders */
+  guint           list_limit;
+  char           *search_query;   /* server-side search results are showing */
+
+  /* preferences */
+  guint           check_minutes;
+  gboolean        notify_new_mail;
+  gboolean        images_from_contacts;
 };
 
 G_DEFINE_FINAL_TYPE (SMailWindow, smail_window, ADW_TYPE_APPLICATION_WINDOW)
@@ -106,6 +125,9 @@ static void refresh_all        (SMailWindow *self);
 static void check_new_mail     (SMailWindow *self, AccountCtx *ctx);
 static void update_filter_folders (SMailWindow *self);
 static void load_messages      (SMailWindow *self);
+static void rebuild_move_menu  (SMailWindow *self);
+static gboolean in_role         (SMailWindow *self, const char *role);
+static void collect_addresses   (SMailWindow *self, const char *list, gboolean outgoing);
 
 static void
 toast (SMailWindow *self, const char *text)
@@ -159,6 +181,14 @@ folder_row_new (AccountCtx *ctx, SMailFolder *folder)
   gtk_widget_add_css_class (badge, "unread-badge");
   gtk_widget_set_valign (badge, GTK_ALIGN_CENTER);
   gtk_box_append (GTK_BOX (box), badge);
+
+  /* sub-folders are indented under their parent */
+  if (folder->path && folder->delimiter && *folder->delimiter && !folder->role) {
+    int depth = 0;
+    for (const char *p = strstr (folder->path, folder->delimiter); p; p = strstr (p + 1, folder->delimiter))
+      depth++;
+    gtk_widget_set_margin_start (box, 14 * MIN (depth, 4));
+  }
 
   GtkWidget *row = gtk_list_box_row_new ();
   gtk_list_box_row_set_child (GTK_LIST_BOX_ROW (row), box);
@@ -307,6 +337,8 @@ show_tool (SMailWindow *self, const char *tool)
   if (g_strcmp0 (tool, "reminders") == 0) smail_reminders_page_refresh (self->reminders_page);
   if (g_strcmp0 (tool, "log") == 0)       smail_mail_log_page_refresh (self->log_page);
   if (g_strcmp0 (tool, "filters") == 0)   smail_filters_page_refresh (self->filters_page);
+  if (g_strcmp0 (tool, "contacts") == 0)  smail_contacts_page_refresh (self->contacts_page);
+  update_actions (self);
 }
 
 static void
@@ -361,6 +393,8 @@ on_folders_listed (GObject *source, GAsyncResult *res, gpointer data)
   }
   rebuild_sidebar (self);
   update_filter_folders (self);
+  if (ctx == self->current_ctx)
+    rebuild_move_menu (self);
   if (folders)
     check_new_mail (self, ctx);
 
@@ -466,8 +500,8 @@ filter_message (gpointer item, gpointer data)
 {
   SMailWindow *self = data;
   const char *query = gtk_editable_get_text (GTK_EDITABLE (self->search_entry));
-  if (!query || !*query)
-    return TRUE;
+  if (!query || !*query || self->search_query)
+    return TRUE; /* server results already match, possibly in the body */
   SMailMessage *msg = item;
   g_autofree char *q = g_utf8_casefold (query, -1);
   g_autofree char *hay = g_strjoin (" ", msg->subject ? msg->subject : "", msg->sender_name ? msg->sender_name : "",
@@ -479,7 +513,28 @@ filter_message (gpointer item, gpointer data)
 static void
 on_search_changed (GtkSearchEntry *entry, SMailWindow *self)
 {
+  const char *q = gtk_editable_get_text (GTK_EDITABLE (entry));
+  if (self->search_query && g_strcmp0 (q, self->search_query) != 0) {
+    /* the text changed: back to filtering the folder as you type */
+    g_clear_pointer (&self->search_query, g_free);
+    load_messages (self);
+  }
   gtk_filter_changed (self->filter, GTK_FILTER_CHANGE_DIFFERENT);
+}
+
+static void update_list_title (SMailWindow *self);
+
+/* Enter: search the whole folder on the server (subject, people and body) */
+static void
+on_search_activate (GtkSearchEntry *entry, SMailWindow *self)
+{
+  g_autofree char *q = g_strstrip (g_strdup (gtk_editable_get_text (GTK_EDITABLE (entry))));
+  if (!*q || !self->current_ctx || !self->current_folder)
+    return;
+  g_free (self->search_query);
+  self->search_query = g_steal_pointer (&q);
+  g_list_store_remove_all (self->messages);
+  load_messages (self);
 }
 
 static void
@@ -552,9 +607,18 @@ on_messages_listed (GObject *source, GAsyncResult *res, gpointer data)
 
   if (msgs->len == 0) {
     show_empty_folder (self);
+    if (self->search_query) {
+      adw_status_page_set_title (ADW_STATUS_PAGE (self->list_empty), "No Results");
+      adw_status_page_set_description (ADW_STATUS_PAGE (self->list_empty),
+                                       "Nothing in this folder matches. Try other words.");
+      adw_status_page_set_icon_name (ADW_STATUS_PAGE (self->list_empty), "system-search-symbolic");
+    }
   } else {
     gtk_stack_set_visible_child_name (GTK_STACK (self->list_stack), "list");
   }
+  /* a full page means there may be older messages */
+  gtk_widget_set_visible (self->load_more, msgs->len >= self->list_limit);
+  update_list_title (self);
 
   if (keep_uid) {
     gboolean found = FALSE;
@@ -590,8 +654,52 @@ load_messages (SMailWindow *self)
   req->self = g_object_ref (self);
   req->ctx = self->current_ctx;
   req->folder = g_strdup (self->current_folder);
-  smail_backend_list_messages (self->current_ctx->backend, self->current_folder, MESSAGE_LIMIT,
+  if (self->search_query)
+    smail_backend_search (self->current_ctx->backend, self->current_folder, self->search_query,
+                          self->list_limit, self->list_cancellable, on_messages_listed, req);
+  else
+    smail_backend_list_messages (self->current_ctx->backend, self->current_folder, self->list_limit,
                                  self->list_cancellable, on_messages_listed, req);
+}
+
+static void
+update_list_title (SMailWindow *self)
+{
+  SMailFolder *f = current_folder (self);
+  const char *name = f ? f->display_name : (self->current_folder ? self->current_folder : "Mail");
+  g_autofree char *title = self->search_query ? g_strdup_printf ("Results for “%s”", self->search_query)
+                                              : g_strdup (name);
+  adw_navigation_page_set_title (ADW_NAVIGATION_PAGE (self->list_page), title);
+  adw_window_title_set_title (ADW_WINDOW_TITLE (self->list_title), title);
+  g_autofree char *sub = self->search_query
+    ? g_strdup_printf ("in %s", name)
+    : g_strdup (self->current_ctx ? smail_backend_get_account (self->current_ctx->backend)->email : NULL);
+  adw_window_title_set_subtitle (ADW_WINDOW_TITLE (self->list_title), sub);
+}
+
+/* "Move To" lists the current account's other folders */
+static void
+rebuild_move_menu (SMailWindow *self)
+{
+  g_menu_remove_all (self->move_menu);
+  AccountCtx *ctx = self->current_ctx;
+  for (guint i = 0; ctx && ctx->folders && i < ctx->folders->len; i++) {
+    SMailFolder *f = g_ptr_array_index (ctx->folders, i);
+    if (g_strcmp0 (f->path, self->current_folder) == 0)
+      continue;
+    g_autofree char *label = NULL;
+    if (!f->role && f->delimiter && *f->delimiter) {
+      /* show the whole path of sub-folders: "Projects › 2026" */
+      g_auto (GStrv) parts = g_strsplit (f->path, f->delimiter, -1);
+      label = g_strjoinv (" › ", parts);
+    } else {
+      label = g_strdup (f->display_name);
+    }
+    GMenuItem *item = g_menu_item_new (label, NULL);
+    g_menu_item_set_action_and_target_value (item, "win.move-to", g_variant_new_string (f->path));
+    g_menu_append_item (self->move_menu, item);
+    g_object_unref (item);
+  }
 }
 
 static void
@@ -600,13 +708,10 @@ select_folder (SMailWindow *self, AccountCtx *ctx, const char *path)
   self->current_ctx = ctx;
   g_free (self->current_folder);
   self->current_folder = g_strdup (path);
-
-  SMailFolder *f = find_folder (ctx, path);
-  const char *name = f ? f->display_name : path;
-  adw_navigation_page_set_title (ADW_NAVIGATION_PAGE (self->list_page), name);
-  adw_window_title_set_title (ADW_WINDOW_TITLE (self->list_title), name);
-  adw_window_title_set_subtitle (ADW_WINDOW_TITLE (self->list_title),
-                                 smail_backend_get_account (ctx->backend)->email);
+  self->list_limit = MESSAGE_LIMIT;
+  g_clear_pointer (&self->search_query, g_free);
+  update_list_title (self);
+  rebuild_move_menu (self);
 
   /* reflect selection in the sidebar */
   for (GtkWidget *row = gtk_widget_get_first_child (self->sidebar); row; row = gtk_widget_get_next_sibling (row))
@@ -667,6 +772,9 @@ on_message_fetched (GObject *source, GAsyncResult *res, gpointer data)
       adjust_unread (self, -1);
     }
     adw_navigation_page_set_title (ADW_NAVIGATION_PAGE (self->viewer_page), detail->subject);
+    smail_message_view_trust_next (SMAIL_MESSAGE_VIEW (self->viewer),
+                                   self->images_from_contacts &&
+                                   smail_store_is_trusted_sender (self->store, detail->from_addr));
     smail_message_view_set_detail (SMAIL_MESSAGE_VIEW (self->viewer), detail);
     gtk_stack_set_visible_child_name (GTK_STACK (self->viewer_stack), "message");
   }
@@ -703,6 +811,9 @@ open_local_copy (SMailWindow *self, SMailMessage *msg, const char *account)
                             on_seen_stored, NULL);
   }
   adw_navigation_page_set_title (ADW_NAVIGATION_PAGE (self->viewer_page), detail->subject);
+  smail_message_view_trust_next (SMAIL_MESSAGE_VIEW (self->viewer),
+                                 self->images_from_contacts &&
+                                 smail_store_is_trusted_sender (self->store, detail->from_addr));
   smail_message_view_set_detail (SMAIL_MESSAGE_VIEW (self->viewer), detail);
   gtk_stack_set_visible_child_name (GTK_STACK (self->viewer_stack), "message");
   update_actions (self);
@@ -904,6 +1015,8 @@ on_inbox_checked (GObject *source, GAsyncResult *res, gpointer data)
     SMailMailLogEntry *e = smail_mail_log_from_message (m, account_email, check->folder);
     smail_store_log_mail (self->store, e, NULL);
     smail_mail_log_free (e);
+    if (m->sender_addr && !self->demo) /* the demo mailbox never enters your address book */
+      smail_store_collect_address (self->store, m->sender_name, m->sender_addr, FALSE);
     if (known)
       g_ptr_array_add (fresh, m);
   }
@@ -923,8 +1036,9 @@ on_inbox_checked (GObject *source, GAsyncResult *res, gpointer data)
       g_notification_set_body (n, account_email);
     }
     g_notification_set_default_action (n, "app.activate");
-    g_application_send_notification (G_APPLICATION (gtk_window_get_application (GTK_WINDOW (self))),
-                                     "new-mail", n);
+    if (self->notify_new_mail)
+      g_application_send_notification (G_APPLICATION (gtk_window_get_application (GTK_WINDOW (self))),
+                                       "new-mail", n);
     g_autofree char *msg = g_strdup_printf (fresh->len == 1 ? "1 new message" : "%u new messages", fresh->len);
     toast (self, msg);
   }
@@ -1119,6 +1233,26 @@ update_actions (SMailWindow *self)
   set_action_enabled (self, "edit-account", has_account && !self->demo);
   set_action_enabled (self, "remove-account", has_account && !self->demo);
 
+  SMailFolder *folder = current_folder (self);
+  gboolean has_folder = folder != NULL && !self->current_tool;
+  gboolean custom = has_folder && !folder->role;
+  gboolean drafts = has_folder && g_strcmp0 (folder->role, "drafts") == 0;
+  gboolean junk = has_folder && g_strcmp0 (folder->role, "junk") == 0;
+  set_action_enabled (self, "edit-draft", has_detail && drafts);
+  gtk_widget_set_visible (self->edit_draft_button, drafts && has_msg);
+  set_action_enabled (self, "move-to", has_msg);
+  set_action_enabled (self, "junk", has_msg && !junk);
+  set_action_enabled (self, "not-junk", has_msg && junk);
+  set_action_enabled (self, "save-message", has_detail);
+  set_action_enabled (self, "view-source", has_detail);
+  set_action_enabled (self, "print", has_detail);
+  set_action_enabled (self, "mark-all-read", has_folder);
+  set_action_enabled (self, "new-folder", has_account && self->current_ctx != NULL);
+  set_action_enabled (self, "rename-folder", custom);
+  set_action_enabled (self, "delete-folder", custom);
+  set_action_enabled (self, "import-messages", has_folder);
+  set_action_enabled (self, "export-folder", has_folder);
+
   if (has_msg) {
     gtk_button_set_icon_name (GTK_BUTTON (self->star_button),
                               self->current_message->flagged ? "starred-symbolic" : "non-starred-symbolic");
@@ -1146,24 +1280,70 @@ on_composer_sent (SMailComposer *composer, GBytes *message, SMailWindow *self)
   smail_mail_log_free (entry);
   if (g_strcmp0 (self->current_tool, "log") == 0)
     smail_mail_log_page_refresh (self->log_page);
+
+  /* people you write to go into the address book (they rank first in autocomplete) */
+  g_autoptr (SMailMessageDetail) sent = smail_message_detail_parse ("", message, NULL);
+  if (sent) {
+    collect_addresses (self, sent->to, TRUE);
+    collect_addresses (self, sent->cc, TRUE);
+  }
+  if (in_role (self, "drafts"))
+    load_messages (self);
   SMailFolder *f = current_folder (self);
   if (f && f->role && g_str_equal (f->role, "sent"))
     load_messages (self);
 }
 
 static void
+on_draft_saved (SMailComposer *composer, SMailWindow *self)
+{
+  if (in_role (self, "drafts"))
+    load_messages (self);
+}
+
+static SMailComposer *
 open_composer (SMailWindow *self, SMailComposeMode mode)
 {
   AccountCtx *ctx = self->current_ctx;
   if (!ctx && self->ctxs->len)
     ctx = g_ptr_array_index (self->ctxs, 0);
-  if (!ctx)
-    return;
+  if (!ctx) {
+    toast (self, "Add an email account to write messages");
+    return NULL;
+  }
   const SMailMessageDetail *detail = mode == SMAIL_COMPOSE_NEW ? NULL
     : smail_message_view_get_detail (SMAIL_MESSAGE_VIEW (self->viewer));
+  if (mode != SMAIL_COMPOSE_NEW && !detail)
+    return NULL;
   SMailComposer *composer = smail_composer_new (GTK_WINDOW (self), ctx->backend, mode, detail);
+  smail_composer_set_address_book (composer, self->store);
   g_signal_connect_object (composer, "sent", G_CALLBACK (on_composer_sent), self, 0);
+  g_signal_connect_object (composer, "draft-saved", G_CALLBACK (on_draft_saved), self, 0);
   gtk_window_present (GTK_WINDOW (composer));
+  return composer;
+}
+
+static void
+compose_to_contact (const char *recipient, gpointer data)
+{
+  SMailComposer *composer = open_composer (data, SMAIL_COMPOSE_NEW);
+  if (composer)
+    smail_composer_set_to (composer, recipient);
+}
+
+/* Remember everyone in an address list (To, Cc, From…) in the address book. */
+static void
+collect_addresses (SMailWindow *self, const char *list, gboolean outgoing)
+{
+  if (!list || self->demo)
+    return;
+  g_autoptr (InternetAddressList) parsed = internet_address_list_parse (NULL, list);
+  for (int i = 0; parsed && i < internet_address_list_length (parsed); i++) {
+    InternetAddress *ia = internet_address_list_get_address (parsed, i);
+    if (INTERNET_ADDRESS_IS_MAILBOX (ia))
+      smail_store_collect_address (self->store, internet_address_get_name (ia),
+                                   internet_address_mailbox_get_addr (INTERNET_ADDRESS_MAILBOX (ia)), outgoing);
+  }
 }
 
 static void compose_activated   (GSimpleAction *a, GVariant *p, gpointer d) { open_composer (d, SMAIL_COMPOSE_NEW); }
@@ -1255,8 +1435,10 @@ on_moved (GObject *source, GAsyncResult *res, gpointer data)
   g_free (req);
 }
 
+typedef enum { MOVE_ARCHIVE, MOVE_TRASH, MOVE_TO } MoveKind;
+
 static void
-move_current (SMailWindow *self, gboolean archive)
+move_current (SMailWindow *self, MoveKind kind, const char *dest, const char *dest_name)
 {
   SMailMessage *msg = self->current_message;
   if (!msg)
@@ -1291,7 +1473,10 @@ move_current (SMailWindow *self, gboolean archive)
 
   MoveRequest *req = g_new0 (MoveRequest, 1);
   req->self = g_object_ref (self);
-  if (archive) {
+  if (kind == MOVE_TO) {
+    req->done_text = g_strdup_printf ("Moved to %s", dest_name ? dest_name : dest);
+    smail_backend_move (self->current_ctx->backend, self->current_folder, keep->uid, dest, on_moved, req);
+  } else if (kind == MOVE_ARCHIVE) {
     req->done_text = g_strdup ("Message archived");
     smail_backend_archive (self->current_ctx->backend, self->current_folder, keep->uid, on_moved, req);
   } else {
@@ -1300,8 +1485,620 @@ move_current (SMailWindow *self, gboolean archive)
   }
 }
 
-static void archive_activated (GSimpleAction *a, GVariant *p, gpointer d) { move_current (d, TRUE); }
-static void trash_activated   (GSimpleAction *a, GVariant *p, gpointer d) { move_current (d, FALSE); }
+static void archive_activated (GSimpleAction *a, GVariant *p, gpointer d) { move_current (d, MOVE_ARCHIVE, NULL, NULL); }
+static void trash_activated   (GSimpleAction *a, GVariant *p, gpointer d) { move_current (d, MOVE_TRASH, NULL, NULL); }
+
+static void
+move_to_activated (GSimpleAction *a, GVariant *param, gpointer data)
+{
+  SMailWindow *self = data;
+  const char *dest = g_variant_get_string (param, NULL);
+  SMailFolder *f = find_folder (self->current_ctx, dest);
+  if (g_strcmp0 (dest, self->current_folder) != 0)
+    move_current (self, MOVE_TO, dest, f ? f->display_name : dest);
+}
+
+static void
+move_to_role (SMailWindow *self, const char *role, const char *missing)
+{
+  if (!self->current_ctx)
+    return;
+  const SMailFolder *f = smail_backend_find_role (self->current_ctx->backend, role);
+  if (!f) {
+    toast (self, missing);
+    return;
+  }
+  if (g_strcmp0 (f->path, self->current_folder) != 0)
+    move_current (self, MOVE_TO, f->path, f->display_name);
+}
+
+static void junk_activated     (GSimpleAction *a, GVariant *p, gpointer d) { move_to_role (d, "junk", "This account has no Junk folder"); }
+static void not_junk_activated (GSimpleAction *a, GVariant *p, gpointer d) { move_to_role (d, "inbox", "This account has no Inbox"); }
+
+static gboolean
+in_role (SMailWindow *self, const char *role)
+{
+  SMailFolder *f = current_folder (self);
+  return f && g_strcmp0 (f->role, role) == 0;
+}
+
+/* --- drafts --- */
+
+static void edit_draft_activated (GSimpleAction *a, GVariant *p, gpointer d) { open_composer (d, SMAIL_COMPOSE_DRAFT); }
+
+/* --- save / source / print --- */
+
+static void
+on_message_saved (GObject *src, GAsyncResult *res, gpointer data)
+{
+  g_autoptr (SMailWindow) self = data;
+  g_autoptr (GError) error = NULL;
+  if (g_file_replace_contents_finish (G_FILE (src), res, NULL, &error))
+    toast (self, "Message saved");
+  else
+    toast (self, error->message);
+}
+
+static void
+on_save_message_chosen (GObject *src, GAsyncResult *res, gpointer data)
+{
+  SMailWindow *self = data;
+  g_autoptr (GFile) file = gtk_file_dialog_save_finish (GTK_FILE_DIALOG (src), res, NULL);
+  const SMailMessageDetail *d = smail_message_view_get_detail (SMAIL_MESSAGE_VIEW (self->viewer));
+  if (file && d && d->raw)
+    g_file_replace_contents_bytes_async (file, d->raw, NULL, FALSE, G_FILE_CREATE_REPLACE_DESTINATION,
+                                         NULL, on_message_saved, g_object_ref (self));
+  g_object_unref (self);
+}
+
+static char *
+safe_file_name (const char *subject, const char *ext)
+{
+  g_autofree char *base = g_strdup (subject && *subject ? subject : "message");
+  g_strdelimit (base, "/\\:*?\"<>|", '_');
+  if (g_utf8_strlen (base, -1) > 80)
+    *g_utf8_offset_to_pointer (base, 80) = '\0';
+  return g_strconcat (g_strstrip (base), ext, NULL);
+}
+
+static void
+save_message_activated (GSimpleAction *a, GVariant *p, gpointer data)
+{
+  SMailWindow *self = data;
+  const SMailMessageDetail *d = smail_message_view_get_detail (SMAIL_MESSAGE_VIEW (self->viewer));
+  if (!d || !d->raw)
+    return;
+  g_autoptr (GtkFileDialog) fd = gtk_file_dialog_new ();
+  gtk_file_dialog_set_title (fd, "Save Message");
+  g_autofree char *name = safe_file_name (d->subject, ".eml");
+  gtk_file_dialog_set_initial_name (fd, name);
+  gtk_file_dialog_save (fd, GTK_WINDOW (self), NULL, on_save_message_chosen, g_object_ref (self));
+}
+
+static void
+view_source_activated (GSimpleAction *a, GVariant *p, gpointer data)
+{
+  SMailWindow *self = data;
+  const SMailMessageDetail *d = smail_message_view_get_detail (SMAIL_MESSAGE_VIEW (self->viewer));
+  if (!d || !d->raw)
+    return;
+  gsize len;
+  const char *raw = g_bytes_get_data (d->raw, &len);
+  g_autofree char *text = g_utf8_make_valid (raw, len);
+
+  GtkWidget *view = gtk_text_view_new ();
+  gtk_text_view_set_editable (GTK_TEXT_VIEW (view), FALSE);
+  gtk_text_view_set_monospace (GTK_TEXT_VIEW (view), TRUE);
+  gtk_text_view_set_wrap_mode (GTK_TEXT_VIEW (view), GTK_WRAP_CHAR);
+  gtk_text_view_set_left_margin (GTK_TEXT_VIEW (view), 12);
+  gtk_text_view_set_right_margin (GTK_TEXT_VIEW (view), 12);
+  gtk_text_view_set_top_margin (GTK_TEXT_VIEW (view), 12);
+  gtk_text_view_set_bottom_margin (GTK_TEXT_VIEW (view), 12);
+  gtk_text_buffer_set_text (gtk_text_view_get_buffer (GTK_TEXT_VIEW (view)), text, -1);
+  GtkWidget *scroll = gtk_scrolled_window_new ();
+  gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (scroll), view);
+  gtk_widget_set_vexpand (scroll, TRUE);
+
+  GtkWidget *toolbar = adw_toolbar_view_new ();
+  GtkWidget *header = adw_header_bar_new ();
+  adw_header_bar_set_title_widget (ADW_HEADER_BAR (header), adw_window_title_new ("Message Source", d->subject));
+  adw_toolbar_view_add_top_bar (ADW_TOOLBAR_VIEW (toolbar), header);
+  adw_toolbar_view_set_content (ADW_TOOLBAR_VIEW (toolbar), scroll);
+  AdwDialog *dialog = adw_dialog_new ();
+  adw_dialog_set_content_width (dialog, 760);
+  adw_dialog_set_content_height (dialog, 620);
+  adw_dialog_set_child (dialog, toolbar);
+  adw_dialog_present (dialog, GTK_WIDGET (self));
+}
+
+static void
+print_activated (GSimpleAction *a, GVariant *p, gpointer data)
+{
+  SMailWindow *self = data;
+  smail_message_view_print (SMAIL_MESSAGE_VIEW (self->viewer));
+}
+
+/* --- folder actions --- */
+
+static void
+on_all_read (GObject *src, GAsyncResult *res, gpointer data)
+{
+  g_autoptr (SMailWindow) self = data;
+  g_autoptr (GError) error = NULL;
+  if (!smail_backend_finish_boolean (SMAIL_BACKEND (src), res, &error)) {
+    toast (self, error->message);
+    load_messages (self);
+  }
+}
+
+static void
+mark_all_read_activated (GSimpleAction *a, GVariant *p, gpointer data)
+{
+  SMailWindow *self = data;
+  if (!self->current_ctx || !self->current_folder)
+    return;
+  guint n = g_list_model_get_n_items (G_LIST_MODEL (self->messages));
+  for (guint i = 0; i < n; i++) {
+    g_autoptr (SMailMessage) m = g_list_model_get_item (G_LIST_MODEL (self->messages), i);
+    smail_message_set_seen (m, TRUE);
+  }
+  SMailFolder *f = current_folder (self);
+  if (f) {
+    f->unread = 0;
+    refresh_badges (self);
+  }
+  update_actions (self);
+  /* "1:*" covers every message in the folder, not just the loaded ones */
+  smail_backend_set_flag (self->current_ctx->backend, self->current_folder, "1:*", "\\Seen", TRUE,
+                          on_all_read, g_object_ref (self));
+}
+
+typedef struct {
+  SMailWindow *self;
+  AccountCtx  *ctx;
+  char        *select_after;  /* folder to open when done, may be NULL */
+  char        *done_text;
+} FolderOp;
+
+static void
+on_folder_op_done (GObject *src, GAsyncResult *res, gpointer data)
+{
+  FolderOp *op = data;
+  SMailWindow *self = op->self;
+  g_autoptr (GError) error = NULL;
+  if (smail_backend_finish_boolean (SMAIL_BACKEND (src), res, &error)) {
+    toast (self, op->done_text);
+    if (op->select_after) {
+      g_free (self->current_folder);  /* reopen once the folder list is back */
+      self->current_folder = g_strdup (op->select_after);
+    }
+    if (g_ptr_array_find (self->ctxs, op->ctx, NULL))
+      list_folders (self, op->ctx);
+    if (op->select_after && g_ptr_array_find (self->ctxs, op->ctx, NULL))
+      select_folder (self, op->ctx, op->select_after);
+  } else {
+    toast (self, error->message);
+  }
+  g_object_unref (op->self);
+  g_free (op->select_after);
+  g_free (op->done_text);
+  g_free (op);
+}
+
+static FolderOp *
+folder_op (SMailWindow *self, const char *select_after, char *done_text)
+{
+  FolderOp *op = g_new0 (FolderOp, 1);
+  op->self = g_object_ref (self);
+  op->ctx = self->current_ctx;
+  op->select_after = g_strdup (select_after);
+  op->done_text = done_text;
+  return op;
+}
+
+/* An alert with a text field; `cb` gets the trimmed text on "ok". */
+typedef void (*TextCallback) (SMailWindow *self, const char *text, gboolean extra);
+
+static void
+on_text_dialog_response (AdwAlertDialog *dialog, const char *response, SMailWindow *self)
+{
+  if (!g_str_equal (response, "ok"))
+    return;
+  GtkWidget *box = adw_alert_dialog_get_extra_child (dialog);
+  GtkWidget *entry = gtk_widget_get_first_child (box);
+  GtkWidget *check = gtk_widget_get_next_sibling (entry);
+  g_autofree char *text = g_strstrip (g_strdup (gtk_editable_get_text (GTK_EDITABLE (entry))));
+  TextCallback cb = g_object_get_data (G_OBJECT (dialog), "callback");
+  if (*text)
+    cb (self, text, check && gtk_check_button_get_active (GTK_CHECK_BUTTON (check)));
+}
+
+static void
+text_dialog (SMailWindow *self, const char *heading, const char *body, const char *initial,
+             const char *ok_label, const char *check_label, TextCallback cb)
+{
+  AdwDialog *d = adw_alert_dialog_new (heading, body);
+  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 8);
+  GtkWidget *entry = gtk_entry_new ();
+  gtk_editable_set_text (GTK_EDITABLE (entry), initial ? initial : "");
+  gtk_entry_set_activates_default (GTK_ENTRY (entry), TRUE);
+  gtk_box_append (GTK_BOX (box), entry);
+  if (check_label) {
+    GtkWidget *check = gtk_check_button_new_with_label (check_label);
+    gtk_box_append (GTK_BOX (box), check);
+  }
+  adw_alert_dialog_set_extra_child (ADW_ALERT_DIALOG (d), box);
+  adw_alert_dialog_add_responses (ADW_ALERT_DIALOG (d), "cancel", "_Cancel", "ok", ok_label, NULL);
+  adw_alert_dialog_set_response_appearance (ADW_ALERT_DIALOG (d), "ok", ADW_RESPONSE_SUGGESTED);
+  adw_alert_dialog_set_default_response (ADW_ALERT_DIALOG (d), "ok");
+  g_object_set_data (G_OBJECT (d), "callback", cb);
+  g_signal_connect (d, "response", G_CALLBACK (on_text_dialog_response), self);
+  adw_dialog_present (d, GTK_WIDGET (self));
+  gtk_widget_grab_focus (entry);
+}
+
+static void
+create_folder_cb (SMailWindow *self, const char *name, gboolean inside)
+{
+  if (!self->current_ctx)
+    return;
+  const char *delim = smail_backend_get_delimiter (self->current_ctx->backend);
+  if (strstr (name, delim)) {
+    toast (self, "Folder names can't contain the folder separator");
+    return;
+  }
+  SMailFolder *cur = current_folder (self);
+  g_autofree char *path = inside && cur ? g_strconcat (cur->path, delim, name, NULL) : g_strdup (name);
+  smail_backend_create_folder (self->current_ctx->backend, path, on_folder_op_done,
+                               folder_op (self, NULL, g_strdup_printf ("Folder “%s” created", name)));
+}
+
+static void
+new_folder_activated (GSimpleAction *a, GVariant *p, gpointer data)
+{
+  SMailWindow *self = data;
+  if (!self->current_ctx)
+    return;
+  SMailFolder *cur = current_folder (self);
+  g_autofree char *inside = cur && g_strcmp0 (cur->role, "inbox") != 0
+                            ? g_strdup_printf ("Inside “%s”", cur->display_name) : NULL;
+  text_dialog (self, "New Folder", NULL, NULL, "_Create", inside, create_folder_cb);
+}
+
+static void
+rename_folder_cb (SMailWindow *self, const char *name, gboolean unused)
+{
+  SMailFolder *cur = current_folder (self);
+  if (!cur || g_str_equal (name, cur->display_name))
+    return;
+  const char *delim = smail_backend_get_delimiter (self->current_ctx->backend);
+  if (strstr (name, delim)) {
+    toast (self, "Folder names can't contain the folder separator");
+    return;
+  }
+  /* keep it under the same parent */
+  const char *last = g_strrstr (cur->path, delim);
+  g_autofree char *parent = last ? g_strndup (cur->path, last - cur->path + strlen (delim)) : g_strdup ("");
+  g_autofree char *to = g_strconcat (parent, name, NULL);
+  smail_backend_rename_folder (self->current_ctx->backend, cur->path, to, on_folder_op_done,
+                               folder_op (self, to, g_strdup_printf ("Renamed to “%s”", name)));
+}
+
+static void
+rename_folder_activated (GSimpleAction *a, GVariant *p, gpointer data)
+{
+  SMailWindow *self = data;
+  SMailFolder *cur = current_folder (self);
+  if (!cur || cur->role)
+    return;
+  text_dialog (self, "Rename Folder", NULL, cur->display_name, "_Rename", NULL, rename_folder_cb);
+}
+
+static void
+on_delete_folder_response (AdwAlertDialog *d, const char *response, SMailWindow *self)
+{
+  SMailFolder *cur = current_folder (self);
+  if (!g_str_equal (response, "delete") || !cur || cur->role)
+    return;
+  g_autofree char *path = g_strdup (cur->path);
+  g_autofree char *name = g_strdup (cur->display_name);
+  /* leave the folder first: open the inbox */
+  const SMailFolder *inbox = smail_backend_find_role (self->current_ctx->backend, "inbox");
+  smail_backend_delete_folder (self->current_ctx->backend, path, on_folder_op_done,
+                               folder_op (self, inbox ? inbox->path : NULL,
+                                          g_strdup_printf ("Folder “%s” deleted", name)));
+}
+
+static void
+delete_folder_activated (GSimpleAction *a, GVariant *p, gpointer data)
+{
+  SMailWindow *self = data;
+  SMailFolder *cur = current_folder (self);
+  if (!cur || cur->role)
+    return;
+  g_autofree char *body = g_strdup_printf ("“%s” and every message in it will be deleted from the server. "
+                                           "This can't be undone.", cur->display_name);
+  AdwDialog *d = adw_alert_dialog_new ("Delete Folder?", body);
+  adw_alert_dialog_add_responses (ADW_ALERT_DIALOG (d), "cancel", "_Cancel", "delete", "_Delete", NULL);
+  adw_alert_dialog_set_response_appearance (ADW_ALERT_DIALOG (d), "delete", ADW_RESPONSE_DESTRUCTIVE);
+  adw_alert_dialog_set_default_response (ADW_ALERT_DIALOG (d), "cancel");
+  g_signal_connect (d, "response", G_CALLBACK (on_delete_folder_response), self);
+  adw_dialog_present (d, GTK_WIDGET (self));
+}
+
+/* --- import / export --- */
+
+typedef struct {
+  SMailWindow *self;
+  AccountCtx  *ctx;
+  char        *folder;
+  int          pending;
+  int          ok;
+  int          failed;
+} ImportRun;
+
+static void
+on_imported_one (GObject *src, GAsyncResult *res, gpointer data)
+{
+  ImportRun *run = data;
+  if (smail_backend_finish_boolean (SMAIL_BACKEND (src), res, NULL))
+    run->ok++;
+  else
+    run->failed++;
+  if (--run->pending > 0)
+    return;
+  SMailWindow *self = run->self;
+  g_autofree char *msg = run->failed
+    ? g_strdup_printf ("Imported %d messages, %d failed", run->ok, run->failed)
+    : g_strdup_printf (run->ok == 1 ? "Imported 1 message" : "Imported %d messages", run->ok);
+  toast (self, msg);
+  if (self->current_ctx == run->ctx && g_strcmp0 (self->current_folder, run->folder) == 0)
+    load_messages (self);
+  if (g_ptr_array_find (self->ctxs, run->ctx, NULL))
+    list_folders (self, run->ctx);
+  g_object_unref (run->self);
+  g_free (run->folder);
+  g_free (run);
+}
+
+static void
+on_import_chosen (GObject *src, GAsyncResult *res, gpointer data)
+{
+  g_autoptr (SMailWindow) self = data;
+  g_autoptr (GListModel) files = gtk_file_dialog_open_multiple_finish (GTK_FILE_DIALOG (src), res, NULL);
+  if (!files || !self->current_ctx || !self->current_folder)
+    return;
+  g_autoptr (GPtrArray) all = g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
+  for (guint i = 0; i < g_list_model_get_n_items (files); i++) {
+    g_autoptr (GFile) file = g_list_model_get_item (files, i);
+    g_autoptr (GError) error = NULL;
+    g_autoptr (GBytes) bytes = g_file_load_bytes (file, NULL, NULL, &error);
+    if (!bytes) {
+      toast (self, error->message);
+      continue;
+    }
+    gsize len;
+    const char *d = g_bytes_get_data (bytes, &len);
+    g_autoptr (GPtrArray) msgs = smail_mbox_split (d, len);
+    for (guint j = 0; j < msgs->len; j++)
+      g_ptr_array_add (all, g_bytes_ref (g_ptr_array_index (msgs, j)));
+  }
+  if (all->len == 0) {
+    toast (self, "No messages found in the chosen files");
+    return;
+  }
+  ImportRun *run = g_new0 (ImportRun, 1);
+  run->self = g_object_ref (self);
+  run->ctx = self->current_ctx;
+  run->folder = g_strdup (self->current_folder);
+  run->pending = all->len;
+  for (guint i = 0; i < all->len; i++)
+    smail_backend_append (self->current_ctx->backend, self->current_folder, g_ptr_array_index (all, i),
+                          "\\Seen", on_imported_one, run);
+}
+
+static void
+import_activated (GSimpleAction *a, GVariant *p, gpointer data)
+{
+  SMailWindow *self = data;
+  g_autoptr (GtkFileDialog) fd = gtk_file_dialog_new ();
+  SMailFolder *f = current_folder (self);
+  g_autofree char *title = g_strdup_printf ("Import Messages into %s", f ? f->display_name : "Folder");
+  gtk_file_dialog_set_title (fd, title);
+  g_autoptr (GtkFileFilter) filter = gtk_file_filter_new ();
+  gtk_file_filter_set_name (filter, "Email Messages (.eml, mbox)");
+  gtk_file_filter_add_pattern (filter, "*.eml");
+  gtk_file_filter_add_pattern (filter, "*.mbox");
+  gtk_file_filter_add_pattern (filter, "*.mbx");
+  gtk_file_filter_add_mime_type (filter, "message/rfc822");
+  gtk_file_filter_add_mime_type (filter, "application/mbox");
+  g_autoptr (GListStore) filters = g_list_store_new (GTK_TYPE_FILE_FILTER);
+  g_list_store_append (filters, filter);
+  g_autoptr (GtkFileFilter) any = gtk_file_filter_new ();
+  gtk_file_filter_set_name (any, "All Files (Thunderbird folders have no extension)");
+  gtk_file_filter_add_pattern (any, "*");
+  g_list_store_append (filters, any);
+  gtk_file_dialog_set_filters (fd, G_LIST_MODEL (filters));
+  gtk_file_dialog_open_multiple (fd, GTK_WINDOW (self), NULL, on_import_chosen, g_object_ref (self));
+}
+
+typedef struct {
+  SMailWindow *self;
+  GFile       *file;
+  guint        count;
+} ExportRun;
+
+static void
+on_export_written (GObject *src, GAsyncResult *res, gpointer data)
+{
+  ExportRun *run = data;
+  g_autoptr (GError) error = NULL;
+  if (g_file_replace_contents_finish (G_FILE (src), res, NULL, &error)) {
+    g_autofree char *msg = g_strdup_printf (run->count == 1 ? "Exported 1 message" : "Exported %u messages",
+                                            run->count);
+    toast (run->self, msg);
+  } else {
+    toast (run->self, error->message);
+  }
+  g_object_unref (run->self);
+  g_object_unref (run->file);
+  g_free (run);
+}
+
+static void
+on_exported (GObject *src, GAsyncResult *res, gpointer data)
+{
+  ExportRun *run = data;
+  g_autoptr (GError) error = NULL;
+  g_autoptr (GBytes) mbox = smail_backend_finish_pointer (SMAIL_BACKEND (src), res, &error);
+  if (!mbox) {
+    toast (run->self, error->message);
+    g_object_unref (run->self);
+    g_object_unref (run->file);
+    g_free (run);
+    return;
+  }
+  g_file_replace_contents_bytes_async (run->file, mbox, NULL, FALSE, G_FILE_CREATE_REPLACE_DESTINATION, NULL,
+                                       on_export_written, run);
+}
+
+static void
+on_export_chosen (GObject *src, GAsyncResult *res, gpointer data)
+{
+  g_autoptr (SMailWindow) self = data;
+  g_autoptr (GFile) file = gtk_file_dialog_save_finish (GTK_FILE_DIALOG (src), res, NULL);
+  if (!file || !self->current_ctx || !self->current_folder)
+    return;
+  /* the messages that are loaded in the list, oldest first */
+  guint n = g_list_model_get_n_items (G_LIST_MODEL (self->messages));
+  g_autoptr (GStrvBuilder) uids = g_strv_builder_new ();
+  g_autoptr (GStrvBuilder) unseen = g_strv_builder_new ();
+  for (guint i = n; i > 0; i--) {
+    g_autoptr (SMailMessage) m = g_list_model_get_item (G_LIST_MODEL (self->messages), i - 1);
+    g_strv_builder_add (uids, m->uid);
+    if (!m->seen)
+      g_strv_builder_add (unseen, m->uid);
+  }
+  g_auto (GStrv) u = g_strv_builder_end (uids);
+  g_auto (GStrv) un = g_strv_builder_end (unseen);
+  ExportRun *run = g_new0 (ExportRun, 1);
+  run->self = g_object_ref (self);
+  run->file = g_object_ref (file);
+  run->count = n;
+  toast (self, "Exporting…");
+  smail_backend_export_mbox (self->current_ctx->backend, self->current_folder,
+                             (const char * const *) u, (const char * const *) un, on_exported, run);
+}
+
+static void
+export_activated (GSimpleAction *a, GVariant *p, gpointer data)
+{
+  SMailWindow *self = data;
+  SMailFolder *f = current_folder (self);
+  if (!f)
+    return;
+  g_autoptr (GtkFileDialog) fd = gtk_file_dialog_new ();
+  gtk_file_dialog_set_title (fd, "Export Folder as mbox");
+  g_autofree char *name = safe_file_name (f->display_name, ".mbox");
+  gtk_file_dialog_set_initial_name (fd, name);
+  gtk_file_dialog_save (fd, GTK_WINDOW (self), NULL, on_export_chosen, g_object_ref (self));
+}
+
+static void
+load_more_activated (GSimpleAction *a, GVariant *p, gpointer data)
+{
+  SMailWindow *self = data;
+  self->list_limit += LOAD_MORE_STEP;
+  load_messages (self);
+}
+
+/* --- preferences --- */
+
+static gboolean auto_refresh (gpointer data);
+
+static void
+apply_preferences (SMailWindow *self)
+{
+  g_autofree char *mins = smail_store_get_setting (self->store, "check-minutes");
+  g_autofree char *notify = smail_store_get_setting (self->store, "notify-new-mail");
+  g_autofree char *images = smail_store_get_setting (self->store, "images-from-contacts");
+  self->check_minutes = mins ? CLAMP (atoi (mins), 1, 120) : 5;
+  self->notify_new_mail = g_strcmp0 (notify, "0") != 0;
+  self->images_from_contacts = g_strcmp0 (images, "0") != 0;
+  g_clear_handle_id (&self->refresh_source, g_source_remove);
+  self->refresh_source = g_timeout_add_seconds (self->check_minutes * 60, auto_refresh, self);
+}
+
+static const guint check_choices[] = { 1, 2, 5, 10, 15, 30, 60 };
+
+static void
+on_pref_interval (AdwComboRow *row, GParamSpec *pspec, SMailWindow *self)
+{
+  guint i = adw_combo_row_get_selected (row);
+  g_autofree char *v = g_strdup_printf ("%u", check_choices[MIN (i, G_N_ELEMENTS (check_choices) - 1)]);
+  smail_store_set_setting (self->store, "check-minutes", v);
+  apply_preferences (self);
+}
+
+static void
+on_pref_switch (AdwSwitchRow *row, GParamSpec *pspec, SMailWindow *self)
+{
+  smail_store_set_setting (self->store, g_object_get_data (G_OBJECT (row), "key"),
+                           adw_switch_row_get_active (row) ? "1" : "0");
+  apply_preferences (self);
+}
+
+static GtkWidget *
+pref_switch (SMailWindow *self, const char *key, const char *title, const char *subtitle, gboolean value)
+{
+  GtkWidget *row = adw_switch_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), title);
+  if (subtitle)
+    adw_action_row_set_subtitle (ADW_ACTION_ROW (row), subtitle);
+  adw_switch_row_set_active (ADW_SWITCH_ROW (row), value);
+  g_object_set_data (G_OBJECT (row), "key", (gpointer) key);
+  g_signal_connect (row, "notify::active", G_CALLBACK (on_pref_switch), self);
+  return row;
+}
+
+static void
+preferences_activated (GSimpleAction *a, GVariant *p, gpointer data)
+{
+  SMailWindow *self = data;
+  AdwDialog *dialog = adw_preferences_dialog_new ();
+  AdwPreferencesPage *page = ADW_PREFERENCES_PAGE (adw_preferences_page_new ());
+  adw_preferences_page_set_title (page, "General");
+  adw_preferences_page_set_icon_name (page, "emblem-system-symbolic");
+
+  AdwPreferencesGroup *mail = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
+  adw_preferences_group_set_title (mail, "New Mail");
+  const char *labels[] = { "Every minute", "Every 2 minutes", "Every 5 minutes", "Every 10 minutes",
+                           "Every 15 minutes", "Every 30 minutes", "Every hour", NULL };
+  GtkWidget *interval = adw_combo_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (interval), "Check for New Mail");
+  adw_combo_row_set_model (ADW_COMBO_ROW (interval), G_LIST_MODEL (gtk_string_list_new (labels)));
+  for (guint i = 0; i < G_N_ELEMENTS (check_choices); i++)
+    if (check_choices[i] == self->check_minutes)
+      adw_combo_row_set_selected (ADW_COMBO_ROW (interval), i);
+  g_signal_connect (interval, "notify::selected", G_CALLBACK (on_pref_interval), self);
+  adw_preferences_group_add (mail, interval);
+  adw_preferences_group_add (mail, pref_switch (self, "notify-new-mail", "Notify About New Mail",
+                                                "Show a desktop notification when mail arrives",
+                                                self->notify_new_mail));
+  adw_preferences_page_add (page, mail);
+
+  AdwPreferencesGroup *privacy = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
+  adw_preferences_group_set_title (privacy, "Privacy");
+  adw_preferences_group_add (privacy, pref_switch (self, "images-from-contacts",
+                                                   "Load Images From People You Know",
+                                                   "Your contacts and people you have written to. Images from "
+                                                   "everyone else stay blocked until you allow them.",
+                                                   self->images_from_contacts));
+  adw_preferences_page_add (page, privacy);
+
+  adw_preferences_dialog_add (ADW_PREFERENCES_DIALOG (dialog), page);
+  adw_dialog_present (dialog, GTK_WIDGET (self));
+}
 
 /* --- refresh / search --- */
 
@@ -1519,6 +2316,24 @@ backup_activated (GSimpleAction *a, GVariant *p, gpointer data)
   smail_backup_dialog_present (GTK_WIDGET (self), self->store, self->accounts, on_restored, self);
 }
 
+static const GActionEntry mail_actions[] = {
+  { "move-to",         move_to_activated, "s" },
+  { "junk",            junk_activated },
+  { "not-junk",        not_junk_activated },
+  { "edit-draft",      edit_draft_activated },
+  { "save-message",    save_message_activated },
+  { "view-source",     view_source_activated },
+  { "print",           print_activated },
+  { "mark-all-read",   mark_all_read_activated },
+  { "new-folder",      new_folder_activated },
+  { "rename-folder",   rename_folder_activated },
+  { "delete-folder",   delete_folder_activated },
+  { "import-messages", import_activated },
+  { "export-folder",   export_activated },
+  { "load-more",       load_more_activated },
+  { "preferences",     preferences_activated },
+};
+
 static const GActionEntry win_actions[] = {
   { "theme",          NULL, "s", "'system'", theme_change_state },
   { "backup",         backup_activated },
@@ -1590,6 +2405,107 @@ header_button (const char *icon, const char *tooltip, const char *action)
   return b;
 }
 
+/* The actions on one message: header "⋮" menu and right-click menu */
+static GMenu *
+message_actions_menu (SMailWindow *self, gboolean with_basics)
+{
+  GMenu *menu = g_menu_new ();
+  if (with_basics) {
+    GMenu *reply = g_menu_new ();
+    g_menu_append (reply, "_Reply", "win.reply");
+    g_menu_append (reply, "Reply _All", "win.reply-all");
+    g_menu_append (reply, "_Forward", "win.forward");
+    g_menu_append (reply, "_Edit Draft", "win.edit-draft");
+    g_menu_append_section (menu, NULL, G_MENU_MODEL (reply));
+    g_object_unref (reply);
+    GMenu *mark = g_menu_new ();
+    g_menu_append (mark, "_Star / Unstar", "win.toggle-star");
+    g_menu_append (mark, "Mark as Read / _Unread", "win.toggle-read");
+    g_menu_append_section (menu, NULL, G_MENU_MODEL (mark));
+    g_object_unref (mark);
+  }
+  GMenu *move = g_menu_new ();
+  g_menu_append_submenu (move, "_Move To", G_MENU_MODEL (self->move_menu));
+  g_menu_append (move, "_Archive", "win.archive");
+  g_menu_append (move, "Mark as _Junk", "win.junk");
+  g_menu_append (move, "_Not Junk", "win.not-junk");
+  if (with_basics)
+    g_menu_append (move, "_Delete", "win.trash");
+  g_menu_append_section (menu, NULL, G_MENU_MODEL (move));
+  g_object_unref (move);
+  GMenu *file = g_menu_new ();
+  g_menu_append (file, "_Save As File…", "win.save-message");
+  g_menu_append (file, "View _Source", "win.view-source");
+  g_menu_append (file, "_Print…", "win.print");
+  g_menu_append_section (menu, NULL, G_MENU_MODEL (file));
+  g_object_unref (file);
+  return menu;
+}
+
+/* The actions on a folder: list header "⋮" menu and right-click on a folder */
+static GMenu *
+folder_actions_menu (void)
+{
+  GMenu *menu = g_menu_new ();
+  GMenu *read = g_menu_new ();
+  g_menu_append (read, "Mark All as _Read", "win.mark-all-read");
+  g_menu_append_section (menu, NULL, G_MENU_MODEL (read));
+  g_object_unref (read);
+  GMenu *folders = g_menu_new ();
+  g_menu_append (folders, "_New Folder…", "win.new-folder");
+  g_menu_append (folders, "Re_name Folder…", "win.rename-folder");
+  g_menu_append (folders, "_Delete Folder…", "win.delete-folder");
+  g_menu_append_section (menu, NULL, G_MENU_MODEL (folders));
+  g_object_unref (folders);
+  GMenu *io = g_menu_new ();
+  g_menu_append (io, "_Import Messages…", "win.import-messages");
+  g_menu_append (io, "_Export Folder…", "win.export-folder");
+  g_menu_append_section (menu, NULL, G_MENU_MODEL (io));
+  g_object_unref (io);
+  return menu;
+}
+
+/* Menus hang off a plain box around each list: a GtkListBox treats every
+ * child as a row (gtk_list_box_remove_all would loop forever on a popover). */
+static void
+popup_at (GtkWidget *popover, GtkWidget *source, double x, double y)
+{
+  graphene_point_t in = GRAPHENE_POINT_INIT ((float) x, (float) y), out;
+  if (!gtk_widget_compute_point (source, gtk_widget_get_parent (popover), &in, &out))
+    out = in;
+  GdkRectangle rect = { (int) out.x, (int) out.y, 1, 1 };
+  gtk_popover_set_pointing_to (GTK_POPOVER (popover), &rect);
+  gtk_popover_popup (GTK_POPOVER (popover));
+}
+
+static void
+on_message_right_click (GtkGestureClick *gesture, int n, double x, double y, SMailWindow *self)
+{
+  GtkListBoxRow *row = gtk_list_box_get_row_at_y (GTK_LIST_BOX (self->message_list), (int) y);
+  SMailMessage *msg = row ? g_object_get_data (G_OBJECT (row), "message") : NULL;
+  if (!msg)
+    return;
+  gtk_list_box_select_row (GTK_LIST_BOX (self->message_list), row);
+  open_message (self, msg);
+  popup_at (self->message_menu, self->message_list, x, y);
+}
+
+static void
+on_folder_right_click (GtkGestureClick *gesture, int n, double x, double y, SMailWindow *self)
+{
+  GtkListBoxRow *row = gtk_list_box_get_row_at_y (GTK_LIST_BOX (self->sidebar), (int) y);
+  AccountCtx *ctx = row ? g_object_get_data (G_OBJECT (row), "ctx") : NULL;
+  const char *path = row ? g_object_get_data (G_OBJECT (row), "path") : NULL;
+  if (!ctx || !path)
+    return;
+  if (self->current_tool)
+    show_tool (self, NULL);
+  if (ctx != self->current_ctx || g_strcmp0 (path, self->current_folder) != 0)
+    select_folder (self, ctx, path);
+  update_actions (self);
+  popup_at (self->folder_menu, self->sidebar, x, y);
+}
+
 static GMenuModel *
 primary_menu (void)
 {
@@ -1610,6 +2526,7 @@ primary_menu (void)
   g_menu_append_section (menu, NULL, G_MENU_MODEL (data));
   g_object_unref (data);
   GMenu *app = g_menu_new ();
+  g_menu_append (app, "_Preferences", "win.preferences");
   g_menu_append (app, "_Keyboard Shortcuts", "app.shortcuts");
   g_menu_append (app, "_About SMail", "app.about");
   g_menu_append_section (menu, NULL, G_MENU_MODEL (app));
@@ -1639,9 +2556,20 @@ build_sidebar_page (SMailWindow *self)
   self->sidebar = gtk_list_box_new ();
   gtk_widget_add_css_class (self->sidebar, "navigation-sidebar");
   g_signal_connect (self->sidebar, "row-activated", G_CALLBACK (on_sidebar_row_activated), self);
+  GtkGesture *fclick = gtk_gesture_click_new ();
+  gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (fclick), GDK_BUTTON_SECONDARY);
+  g_signal_connect (fclick, "pressed", G_CALLBACK (on_folder_right_click), self);
+  gtk_widget_add_controller (self->sidebar, GTK_EVENT_CONTROLLER (fclick));
+  g_autoptr (GMenu) fmenu = folder_actions_menu ();
+  self->folder_menu = gtk_popover_menu_new_from_model (G_MENU_MODEL (fmenu));
+  gtk_popover_set_has_arrow (GTK_POPOVER (self->folder_menu), FALSE);
+  gtk_widget_set_halign (self->folder_menu, GTK_ALIGN_START);
+  GtkWidget *sidebar_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_box_append (GTK_BOX (sidebar_box), self->sidebar);
+  gtk_widget_set_parent (self->folder_menu, sidebar_box);
   GtkWidget *scroll = gtk_scrolled_window_new ();
   gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
-  gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (scroll), self->sidebar);
+  gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (scroll), sidebar_box);
   adw_toolbar_view_set_content (ADW_TOOLBAR_VIEW (toolbar), scroll);
 
   AdwNavigationPage *page = adw_navigation_page_new (toolbar, "SMail");
@@ -1658,6 +2586,12 @@ build_list_page (SMailWindow *self)
 
   self->refresh_button = header_button ("view-refresh-symbolic", "Refresh (F5)", "win.refresh");
   adw_header_bar_pack_start (ADW_HEADER_BAR (header), self->refresh_button);
+  GtkWidget *folder_button = gtk_menu_button_new ();
+  gtk_menu_button_set_icon_name (GTK_MENU_BUTTON (folder_button), "view-more-symbolic");
+  gtk_widget_set_tooltip_text (folder_button, "Folder Actions");
+  g_autoptr (GMenu) fmenu = folder_actions_menu ();
+  gtk_menu_button_set_menu_model (GTK_MENU_BUTTON (folder_button), G_MENU_MODEL (fmenu));
+  adw_header_bar_pack_end (ADW_HEADER_BAR (header), folder_button);
   GtkWidget *search = gtk_toggle_button_new ();
   gtk_button_set_icon_name (GTK_BUTTON (search), "system-search-symbolic");
   gtk_widget_set_tooltip_text (search, "Search (Ctrl+F)");
@@ -1665,9 +2599,11 @@ build_list_page (SMailWindow *self)
   adw_toolbar_view_add_top_bar (ADW_TOOLBAR_VIEW (toolbar), header);
 
   self->search_entry = gtk_search_entry_new ();
-  gtk_search_entry_set_placeholder_text (GTK_SEARCH_ENTRY (self->search_entry), "Search messages");
+  gtk_search_entry_set_placeholder_text (GTK_SEARCH_ENTRY (self->search_entry),
+                                        "Filter, or press Enter to search the whole folder");
   gtk_widget_set_hexpand (self->search_entry, TRUE);
   g_signal_connect (self->search_entry, "search-changed", G_CALLBACK (on_search_changed), self);
+  g_signal_connect (self->search_entry, "activate", G_CALLBACK (on_search_activate), self);
   self->search_bar = gtk_search_bar_new ();
   gtk_search_bar_set_child (GTK_SEARCH_BAR (self->search_bar), self->search_entry);
   gtk_search_bar_connect_entry (GTK_SEARCH_BAR (self->search_bar), GTK_EDITABLE (self->search_entry));
@@ -1685,9 +2621,27 @@ build_list_page (SMailWindow *self)
                            create_message_row, self, NULL);
   g_object_unref (filtered);
   g_signal_connect (self->message_list, "row-activated", G_CALLBACK (on_message_row_activated), self);
+  GtkGesture *click = gtk_gesture_click_new ();
+  gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (click), GDK_BUTTON_SECONDARY);
+  g_signal_connect (click, "pressed", G_CALLBACK (on_message_right_click), self);
+  gtk_widget_add_controller (self->message_list, GTK_EVENT_CONTROLLER (click));
+  g_autoptr (GMenu) mmenu = message_actions_menu (self, TRUE);
+  self->message_menu = gtk_popover_menu_new_from_model (G_MENU_MODEL (mmenu));
+  gtk_popover_set_has_arrow (GTK_POPOVER (self->message_menu), FALSE);
+  gtk_widget_set_halign (self->message_menu, GTK_ALIGN_START);
+
+  self->load_more = gtk_button_new_with_label ("Load Older Messages");
+  gtk_actionable_set_action_name (GTK_ACTIONABLE (self->load_more), "win.load-more");
+  gtk_widget_add_css_class (self->load_more, "flat");
+  gtk_widget_add_css_class (self->load_more, "load-more");
+  gtk_widget_set_visible (self->load_more, FALSE);
+  GtkWidget *list_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_box_append (GTK_BOX (list_box), self->message_list);
+  gtk_box_append (GTK_BOX (list_box), self->load_more);
+  gtk_widget_set_parent (self->message_menu, list_box);
   GtkWidget *scroll = gtk_scrolled_window_new ();
   gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
-  gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (scroll), self->message_list);
+  gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (scroll), list_box);
 
   GtkWidget *spinner = gtk_spinner_new ();
   gtk_spinner_set_spinning (GTK_SPINNER (spinner), TRUE);
@@ -1721,7 +2675,23 @@ build_viewer_page (SMailWindow *self)
   adw_header_bar_pack_start (ADW_HEADER_BAR (header), self->reply_all_button);
   adw_header_bar_pack_start (ADW_HEADER_BAR (header),
                              header_button ("mail-forward-symbolic", "Forward (Ctrl+L)", "win.forward"));
+  self->edit_draft_button = gtk_button_new ();
+  GtkWidget *edit_content = adw_button_content_new ();
+  adw_button_content_set_icon_name (ADW_BUTTON_CONTENT (edit_content), "document-edit-symbolic");
+  adw_button_content_set_label (ADW_BUTTON_CONTENT (edit_content), "Edit Draft");
+  gtk_button_set_child (GTK_BUTTON (self->edit_draft_button), edit_content);
+  gtk_actionable_set_action_name (GTK_ACTIONABLE (self->edit_draft_button), "win.edit-draft");
+  gtk_widget_set_tooltip_text (self->edit_draft_button, "Continue Writing (Ctrl+E)");
+  gtk_widget_add_css_class (self->edit_draft_button, "suggested-action");
+  gtk_widget_set_visible (self->edit_draft_button, FALSE);
+  adw_header_bar_pack_start (ADW_HEADER_BAR (header), self->edit_draft_button);
 
+  GtkWidget *more = gtk_menu_button_new ();
+  gtk_menu_button_set_icon_name (GTK_MENU_BUTTON (more), "view-more-symbolic");
+  gtk_widget_set_tooltip_text (more, "More Actions");
+  g_autoptr (GMenu) more_menu = message_actions_menu (self, FALSE);
+  gtk_menu_button_set_menu_model (GTK_MENU_BUTTON (more), G_MENU_MODEL (more_menu));
+  adw_header_bar_pack_end (ADW_HEADER_BAR (header), more);
   adw_header_bar_pack_end (ADW_HEADER_BAR (header),
                            header_button ("user-trash-symbolic", "Move to Trash (Delete)", "win.trash"));
   adw_header_bar_pack_end (ADW_HEADER_BAR (header),
@@ -1795,6 +2765,14 @@ smail_window_dispose (GObject *object)
   SMailWindow *self = SMAIL_WINDOW (object);
   g_clear_handle_id (&self->refresh_source, g_source_remove);
   g_clear_handle_id (&self->reminder_source, g_source_remove);
+  if (self->message_menu) {
+    gtk_widget_unparent (self->message_menu);
+    self->message_menu = NULL;
+  }
+  if (self->folder_menu) {
+    gtk_widget_unparent (self->folder_menu);
+    self->folder_menu = NULL;
+  }
   if (self->lan)
     smail_lan_stop (self->lan);
   g_cancellable_cancel (self->list_cancellable);
@@ -1815,6 +2793,8 @@ smail_window_finalize (GObject *object)
   g_clear_object (&self->fetch_cancellable);
   g_free (self->current_folder);
   g_free (self->current_tool);
+  g_free (self->search_query);
+  g_clear_object (&self->move_menu);
   g_clear_object (&self->lan);
   smail_store_close (self->store);
   G_OBJECT_CLASS (smail_window_parent_class)->finalize (object);
@@ -1847,6 +2827,9 @@ smail_window_init (SMailWindow *self)
   gtk_window_set_default_size (GTK_WINDOW (self), 1180, 760);
   gtk_widget_set_size_request (GTK_WIDGET (self), 360, 300);
   g_action_map_add_action_entries (G_ACTION_MAP (self), win_actions, G_N_ELEMENTS (win_actions), self);
+  g_action_map_add_action_entries (G_ACTION_MAP (self), mail_actions, G_N_ELEMENTS (mail_actions), self);
+  self->move_menu = g_menu_new ();
+  self->list_limit = MESSAGE_LIMIT;
 
   /* folders | (list | viewer) — libadwaita's triple pane pattern */
   self->inner_split = adw_navigation_split_view_new ();
@@ -1870,6 +2853,7 @@ smail_window_init (SMailWindow *self)
   smail_chat_page_set_unread_func (self->chat_page, on_chat_unread, self);
   self->log_page = smail_mail_log_page_new (self->store);
   self->filters_page = smail_filters_page_new (self->store, run_filters_now, self);
+  self->contacts_page = smail_contacts_page_new (self->store, compose_to_contact, self);
 
   self->content_stack = gtk_stack_new ();
   gtk_stack_add_named (GTK_STACK (self->content_stack), self->inner_split, "mail");
@@ -1879,6 +2863,7 @@ smail_window_init (SMailWindow *self)
   gtk_stack_add_named (GTK_STACK (self->content_stack), self->chat_page, "chat");
   gtk_stack_add_named (GTK_STACK (self->content_stack), self->log_page, "log");
   gtk_stack_add_named (GTK_STACK (self->content_stack), self->filters_page, "filters");
+  gtk_stack_add_named (GTK_STACK (self->content_stack), self->contacts_page, "contacts");
   self->content_page = GTK_WIDGET (adw_navigation_page_new (self->content_stack, "Mail"));
   adw_navigation_split_view_set_content (ADW_NAVIGATION_SPLIT_VIEW (self->outer_split),
                                          ADW_NAVIGATION_PAGE (self->content_page));
@@ -1912,7 +2897,7 @@ smail_window_init (SMailWindow *self)
                               NULL);
   adw_application_window_add_breakpoint (ADW_APPLICATION_WINDOW (self), bp);
 
-  self->refresh_source = g_timeout_add_seconds (AUTO_REFRESH_SECONDS, auto_refresh, self);
+  apply_preferences (self);
   self->reminder_source = g_timeout_add_seconds (REMINDER_CHECK_SECONDS, check_reminders, self);
   g_idle_add_full (G_PRIORITY_LOW, check_reminders_once, g_object_ref (self), g_object_unref);
 }

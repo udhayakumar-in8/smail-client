@@ -1,6 +1,7 @@
 /* smail-backend.c — threaded dispatch + IMAP implementation */
 #include "smail-backend.h"
 #include "smail-imap.h"
+#include "smail-mbox.h"
 
 #include <string.h>
 
@@ -89,6 +90,7 @@ typedef enum {
   JOB_DELETE_FOLDER,
   JOB_SAVE_DRAFT,
   JOB_DELETE_MESSAGE,
+  JOB_EXPORT,
 } JobKind;
 
 typedef struct {
@@ -101,6 +103,8 @@ typedef struct {
   GBytes  *message;
   char    *from;
   GStrv    recipients;
+  GStrv    uids;
+  GStrv    unseen;
 } Job;
 
 static void
@@ -112,6 +116,8 @@ job_free (Job *job)
   g_clear_pointer (&job->message, g_bytes_unref);
   g_free (job->from);
   g_strfreev (job->recipients);
+  g_strfreev (job->uids);
+  g_strfreev (job->unseen);
   g_free (job);
 }
 
@@ -230,6 +236,24 @@ run_job (GTask *task, gpointer source, gpointer task_data, GCancellable *cancell
         (!job->message || klass->append (self, job->folder, job->message, job->flag, &error)))
       g_task_return_boolean (task, TRUE);
     break;
+  case JOB_EXPORT: {
+    GString *mbox = g_string_new (NULL);
+    for (int i = 0; job->uids && job->uids[i] && !error; i++) {
+      g_autoptr (GBytes) raw = klass->fetch_message (self, job->folder, job->uids[i], &error);
+      if (!raw)
+        break;
+      g_autoptr (SMailMessageDetail) d = smail_message_detail_parse (job->uids[i], raw, NULL);
+      smail_mbox_append (mbox, raw, d ? d->from_addr : NULL, d ? d->date : NULL);
+    }
+    /* downloading marked them read on the server: undo that */
+    for (int i = 0; job->unseen && job->unseen[i]; i++)
+      klass->set_flag (self, job->folder, job->unseen[i], "\\Seen", FALSE, NULL);
+    if (error)
+      g_string_free (mbox, TRUE);
+    else
+      g_task_return_pointer (task, g_string_free_to_bytes (mbox), (GDestroyNotify) g_bytes_unref);
+    break;
+  }
   case JOB_DELETE_MESSAGE:
     if (klass->remove (self, job->folder, job->uid, &error))
       g_task_return_boolean (task, TRUE);
@@ -414,6 +438,16 @@ smail_backend_delete_message (SMailBackend *self, const char *folder, const char
 {
   Job *job = new_job (JOB_DELETE_MESSAGE, folder, NULL);
   job->uid = g_strdup (uid);
+  start_job (self, job, NULL, cb, data);
+}
+
+void
+smail_backend_export_mbox (SMailBackend *self, const char *folder, const char * const *uids,
+                           const char * const *unseen, GAsyncReadyCallback cb, gpointer data)
+{
+  Job *job = new_job (JOB_EXPORT, folder, NULL);
+  job->uids = g_strdupv ((char **) uids);
+  job->unseen = g_strdupv ((char **) unseen);
   start_job (self, job, NULL, cb, data);
 }
 

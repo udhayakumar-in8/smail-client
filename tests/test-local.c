@@ -402,14 +402,18 @@ test_mbox (void)
   const char *eml = "From: c@example.org\nSubject: three\n\nbody\n";
   g_autoptr (GPtrArray) one = smail_mbox_split (eml, strlen (eml));
   g_assert_cmpuint (one->len, ==, 1);
-  g_assert_cmpstr (g_bytes_get_data (g_ptr_array_index (one, 0), NULL), ==,
-                   "From: c@example.org\r\nSubject: three\r\n\r\nbody\r\n");
+  const char *want = "From: c@example.org\r\nSubject: three\r\n\r\nbody\r\n";
+  g_autoptr (GBytes) want_b = g_bytes_new_static (want, strlen (want));
+  g_assert_true (g_bytes_equal (g_ptr_array_index (one, 0), want_b));
 
   /* an mbox "From " line inside a body only counts after a blank line */
   const char *tricky = "From x Tue Nov  3 10:00:00 2026\nSubject: a\n\nline\nFrom y in the text\n\nFrom z Tue Nov  3 10:00:00 2026\nSubject: b\n\nok\n";
   g_autoptr (GPtrArray) two = smail_mbox_split (tricky, strlen (tricky));
   g_assert_cmpuint (two->len, ==, 2);
-  g_assert_nonnull (strstr (g_bytes_get_data (g_ptr_array_index (two, 0), NULL), "From y in the text"));
+  gsize first_len;
+  const char *first = g_bytes_get_data (g_ptr_array_index (two, 0), &first_len);
+  g_autofree char *first_str = g_strndup (first, first_len);
+  g_assert_nonnull (strstr (first_str, "From y in the text"));
 
   g_autoptr (GPtrArray) none = smail_mbox_split ("", 0);
   g_assert_cmpuint (none->len, ==, 0);

@@ -108,7 +108,10 @@ on_changed (GtkEditable *editable, Completion *c)
   }
   gtk_list_box_select_row (GTK_LIST_BOX (c->list), gtk_list_box_get_row_at_index (GTK_LIST_BOX (c->list), 0));
   gtk_widget_set_size_request (c->popover, MAX (gtk_widget_get_width (c->editable), 280), -1);
-  gtk_popover_popup (GTK_POPOVER (c->popover));
+  if (gtk_widget_get_visible (c->popover))
+    gtk_popover_present (GTK_POPOVER (c->popover)); /* re-measure: the list may have shrunk */
+  else
+    gtk_popover_popup (GTK_POPOVER (c->popover));
 }
 
 static gboolean

@@ -4,6 +4,7 @@
 
 #include <webkit/webkit.h>
 #include <string.h>
+#include <glib/gstdio.h>
 
 struct _SMailMessageView {
   GtkBox     parent_instance;
@@ -21,6 +22,7 @@ struct _SMailMessageView {
 
   SMailMessageDetail *detail;
   gboolean              allow_remote;
+  gboolean              trust_next;   /* show remote images for the next message */
 };
 
 G_DEFINE_FINAL_TYPE (SMailMessageView, smail_message_view, GTK_TYPE_BOX)
@@ -173,14 +175,67 @@ on_save_dialog_done (GObject *source, GAsyncResult *res, gpointer data)
 }
 
 static void
-on_attachment_clicked (GtkButton *button, SMailMessageView *self)
+save_attachment (SMailMessageView *self, SMailAttachment *a)
 {
-  SMailAttachment *a = g_object_get_data (G_OBJECT (button), "attachment");
   g_autoptr (GtkFileDialog) dialog = gtk_file_dialog_new ();
   gtk_file_dialog_set_title (dialog, "Save Attachment");
   gtk_file_dialog_set_initial_name (dialog, a->filename);
   gtk_file_dialog_save (dialog, GTK_WINDOW (gtk_widget_get_root (GTK_WIDGET (self))), NULL,
                         on_save_dialog_done, g_bytes_ref (a->data));
+}
+
+/* Open with the default app: write to a private cache folder first. */
+static void
+open_attachment (SMailMessageView *self, SMailAttachment *a)
+{
+  /* a fresh private folder per open, so names never clash */
+  g_autofree char *id = g_uuid_string_random ();
+  g_autofree char *sub = g_build_filename (g_get_user_cache_dir (), "smail", "attachments", id, NULL);
+  g_mkdir_with_parents (sub, 0700);
+  /* keep the real name (apps show it) but never let it escape the folder */
+  g_autofree char *base = g_path_get_basename (a->filename && *a->filename ? a->filename : "attachment");
+  if (g_str_equal (base, ".") || g_str_equal (base, "..") || g_str_equal (base, G_DIR_SEPARATOR_S)) {
+    g_free (base);
+    base = g_strdup ("attachment");
+  }
+  g_autofree char *path = g_build_filename (sub, base, NULL);
+  gsize len;
+  const char *data = g_bytes_get_data (a->data, &len);
+  g_autoptr (GError) error = NULL;
+  if (!g_file_set_contents_full (path, data, len, G_FILE_SET_CONTENTS_CONSISTENT, 0600, &error)) {
+    g_warning ("Could not open attachment: %s", error->message);
+    return;
+  }
+  g_autoptr (GFile) file = g_file_new_for_path (path);
+  g_autoptr (GtkFileLauncher) launcher = gtk_file_launcher_new (file);
+  gtk_file_launcher_launch (launcher, GTK_WINDOW (gtk_widget_get_root (GTK_WIDGET (self))), NULL, NULL, NULL);
+}
+
+static void
+on_attachment_open (GtkButton *b, SMailMessageView *self)
+{
+  gtk_popover_popdown (GTK_POPOVER (gtk_widget_get_ancestor (GTK_WIDGET (b), GTK_TYPE_POPOVER)));
+  open_attachment (self, g_object_get_data (G_OBJECT (b), "attachment"));
+}
+
+static void
+on_attachment_save (GtkButton *b, SMailMessageView *self)
+{
+  gtk_popover_popdown (GTK_POPOVER (gtk_widget_get_ancestor (GTK_WIDGET (b), GTK_TYPE_POPOVER)));
+  save_attachment (self, g_object_get_data (G_OBJECT (b), "attachment"));
+}
+
+static GtkWidget *
+popover_item (const char *icon, const char *label)
+{
+  GtkWidget *b = gtk_button_new ();
+  GtkWidget *content = adw_button_content_new ();
+  adw_button_content_set_icon_name (ADW_BUTTON_CONTENT (content), icon);
+  adw_button_content_set_label (ADW_BUTTON_CONTENT (content), label);
+  gtk_widget_set_halign (content, GTK_ALIGN_START);
+  gtk_button_set_child (GTK_BUTTON (b), content);
+  gtk_widget_add_css_class (b, "flat");
+  return b;
 }
 
 static GtkWidget *
@@ -208,12 +263,23 @@ attachment_button (SMailMessageView *self, SMailAttachment *a)
   gtk_box_append (GTK_BOX (labels), sz);
   gtk_box_append (GTK_BOX (box), labels);
 
-  GtkWidget *button = gtk_button_new ();
-  gtk_button_set_child (GTK_BUTTON (button), box);
+  /* click: Open / Save As… */
+  GtkWidget *menu = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  GtkWidget *open = popover_item ("document-open-symbolic", "Open");
+  GtkWidget *save = popover_item ("document-save-symbolic", "Save As…");
+  g_object_set_data (G_OBJECT (open), "attachment", a);
+  g_object_set_data (G_OBJECT (save), "attachment", a);
+  g_signal_connect (open, "clicked", G_CALLBACK (on_attachment_open), self);
+  g_signal_connect (save, "clicked", G_CALLBACK (on_attachment_save), self);
+  gtk_box_append (GTK_BOX (menu), open);
+  gtk_box_append (GTK_BOX (menu), save);
+  GtkWidget *popover = gtk_popover_new ();
+  gtk_popover_set_child (GTK_POPOVER (popover), menu);
+
+  GtkWidget *button = gtk_menu_button_new ();
+  gtk_menu_button_set_child (GTK_MENU_BUTTON (button), box);
+  gtk_menu_button_set_popover (GTK_MENU_BUTTON (button), popover);
   gtk_widget_add_css_class (button, "attachment");
-  gtk_widget_set_tooltip_text (button, "Save attachment");
-  g_object_set_data (G_OBJECT (button), "attachment", a);
-  g_signal_connect (button, "clicked", G_CALLBACK (on_attachment_clicked), self);
   return button;
 }
 
@@ -229,7 +295,8 @@ smail_message_view_set_detail (SMailMessageView *self, SMailMessageDetail *detai
 
   g_clear_pointer (&self->detail, smail_message_detail_free);
   self->detail = detail;
-  self->allow_remote = FALSE;
+  self->allow_remote = self->trust_next;
+  self->trust_next = FALSE;
 
   if (!detail)
     return;
@@ -258,6 +325,21 @@ smail_message_view_set_detail (SMailMessageView *self, SMailMessageDetail *detai
   gtk_widget_set_visible (self->attachments, detail->attachments->len > 0);
 
   render_body (self);
+}
+
+void
+smail_message_view_trust_next (SMailMessageView *self, gboolean trusted)
+{
+  self->trust_next = trusted;
+}
+
+void
+smail_message_view_print (SMailMessageView *self)
+{
+  if (!self->detail)
+    return;
+  g_autoptr (WebKitPrintOperation) op = webkit_print_operation_new (WEBKIT_WEB_VIEW (self->web_view));
+  webkit_print_operation_run_dialog (op, GTK_WINDOW (gtk_widget_get_root (GTK_WIDGET (self))));
 }
 
 const SMailMessageDetail *

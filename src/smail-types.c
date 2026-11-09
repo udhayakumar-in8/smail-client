@@ -123,7 +123,8 @@ smail_folder_compare (gconstpointer pa, gconstpointer pb)
   int ra = role_rank (a->role), rb = role_rank (b->role);
   if (ra != rb)
     return ra - rb;
-  return g_utf8_collate (a->display_name, b->display_name);
+  /* by full path, so sub-folders come right after their parent */
+  return g_utf8_collate (a->path ? a->path : a->display_name, b->path ? b->path : b->display_name);
 }
 
 /* ================= Message summary ================= */

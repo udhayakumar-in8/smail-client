@@ -84,6 +84,11 @@ void       smail_backend_save_draft      (SMailBackend *self, const char *folder
                                           GAsyncReadyCallback cb, gpointer data);
 void       smail_backend_delete_message  (SMailBackend *self, const char *folder, const char *uid,
                                           GAsyncReadyCallback cb, gpointer data);
+/* Download `uids` from `folder` into one mbox (GBytes*, via finish_pointer).
+ * Messages listed in `unseen` are marked unread again afterwards. */
+void       smail_backend_export_mbox     (SMailBackend *self, const char *folder,
+                                          const char * const *uids, const char * const *unseen,
+                                          GAsyncReadyCallback cb, gpointer data);
 /* Folder separator used by the server ("/" or "."), known after list_folders. */
 const char *smail_backend_get_delimiter  (SMailBackend *self);
 

@@ -9,6 +9,7 @@
 #include "smail-backend.h"
 #include "smail-gmime.h"
 #include "smail-util.h"
+#include "smail-mbox.h"
 
 #include <string.h>
 
@@ -297,6 +298,27 @@ test_imap (void)
     g_clear_error (&error);
   }
 
+  /* drafts: replace by Message-ID */
+  {
+    const char *d1 = "From: test@local\r\nSubject: Draft v1\r\nMessage-ID: <draft-42@local>\r\n\r\nfirst\r\n";
+    const char *d2 = "From: test@local\r\nSubject: Draft v2\r\nMessage-ID: <draft-42@local>\r\n\r\nsecond\r\n";
+    g_autoptr (GBytes) b1 = g_bytes_new_static (d1, strlen (d1));
+    g_autoptr (GBytes) b2 = g_bytes_new_static (d2, strlen (d2));
+    smail_imap_delete_folder (imap, "Drafts", NULL);
+    g_assert_true (smail_imap_create_folder (imap, "Drafts", &error));
+    g_assert_true (smail_imap_append (imap, "Drafts", b1, "\\Draft \\Seen", &error));
+    g_assert_true (smail_imap_append (imap, "Drafts", m1, NULL, &error));      /* unrelated message */
+    g_assert_cmpint (smail_imap_delete_by_message_id (imap, "Drafts", "draft-42@local", &error), ==, 1);
+    g_assert_no_error (error);
+    g_assert_true (smail_imap_append (imap, "Drafts", b2, "\\Draft \\Seen", &error));
+    g_autoptr (GPtrArray) drafts = smail_imap_list_messages (imap, "Drafts", 10, &error);
+    g_assert_cmpuint (drafts->len, ==, 2);
+    g_assert_nonnull (find_subject (drafts, "Draft v2"));
+    g_assert_null (find_subject (drafts, "Draft v1"));
+    g_assert_cmpint (smail_imap_delete_by_message_id (imap, "Drafts", "<nothing@local>", &error), ==, 0);
+    smail_imap_delete_folder (imap, "Drafts", NULL);
+  }
+
   /* server NO on a missing folder */
   g_autoptr (GPtrArray) none = smail_imap_list_messages (imap, "Does Not Exist", 10, &error);
   g_assert_null (none);
@@ -304,6 +326,66 @@ test_imap (void)
   g_clear_error (&error);
   g_assert_true (smail_imap_is_connected (imap));
 
+  smail_imap_logout (imap);
+  smail_imap_free (imap);
+}
+
+static void
+on_exported (GObject *src, GAsyncResult *res, gpointer data)
+{
+  gpointer *out = data;
+  out[0] = smail_backend_finish_pointer (SMAIL_BACKEND (src), res, (GError **) &out[1]);
+  g_main_loop_quit (out[2]);
+}
+
+static void
+test_export (void)
+{
+  g_autoptr (SMailAccount) account = test_account ();
+  if (!account) {
+    g_test_skip ("SMAIL_TEST_IMAP not set");
+    return;
+  }
+  g_autoptr (GError) error = NULL;
+  SMailImap *imap = smail_imap_connect (account, NULL, &error);
+  g_assert_no_error (error);
+  smail_imap_delete_folder (imap, "Export", NULL);
+  g_assert_true (smail_imap_create_folder (imap, "Export", &error));
+  const char *a = "From: Ann <ann@example.org>\r\nSubject: A\r\nDate: Mon, 02 Nov 2026 09:00:00 +0000\r\n\r\nFrom the start\r\n";
+  const char *b = "From: bob@example.org\r\nSubject: B\r\n\r\nbody b\r\n";
+  g_autoptr (GBytes) ba = g_bytes_new_static (a, strlen (a));
+  g_autoptr (GBytes) bb = g_bytes_new_static (b, strlen (b));
+  g_assert_true (smail_imap_append (imap, "Export", ba, "\\Seen", &error));
+  g_assert_true (smail_imap_append (imap, "Export", bb, NULL, &error));     /* unread */
+  g_autoptr (GPtrArray) before = smail_imap_list_messages (imap, "Export", 10, &error);
+  g_assert_cmpuint (before->len, ==, 2);
+  SMailMessage *ma = find_subject (before, "A"), *mb = find_subject (before, "B");
+  smail_imap_logout (imap);
+  smail_imap_free (imap);
+
+  g_autoptr (SMailBackend) backend = smail_backend_new_imap (account);
+  const char *uids[] = { ma->uid, mb->uid, NULL };
+  const char *unseen[] = { mb->uid, NULL };
+  gpointer out[3] = { NULL, NULL, g_main_loop_new (NULL, FALSE) };
+  smail_backend_export_mbox (backend, "Export", uids, unseen, on_exported, out);
+  g_main_loop_run (out[2]);
+  g_main_loop_unref (out[2]);
+  g_assert_no_error (out[1]);
+  g_autoptr (GBytes) mbox = out[0];
+  gsize len;
+  const char *data = g_bytes_get_data (mbox, &len);
+  g_autofree char *text = g_strndup (data, len);
+  g_assert_true (g_str_has_prefix (text, "From ann@example.org Mon Nov  2 09:00:00 2026\n"));
+  g_assert_nonnull (strstr (text, "\n>From the start\n"));
+  g_autoptr (GPtrArray) split = smail_mbox_split (data, len);
+  g_assert_cmpuint (split->len, ==, 2);
+
+  /* B is still unread on the server */
+  imap = smail_imap_connect (account, NULL, &error);
+  g_autoptr (GPtrArray) after = smail_imap_list_messages (imap, "Export", 10, &error);
+  g_assert_false (find_subject (after, "B")->seen);
+  g_assert_true (find_subject (after, "A")->seen);
+  smail_imap_delete_folder (imap, "Export", NULL);
   smail_imap_logout (imap);
   smail_imap_free (imap);
 }
@@ -332,6 +414,7 @@ main (int argc, char *argv[])
   g_test_add_func ("/mime/parse", test_parse);
   g_test_add_func ("/util/text", test_text_helpers);
   g_test_add_func ("/imap/server", test_imap);
+  g_test_add_func ("/imap/export", test_export);
   g_test_add_func ("/smtp/send", test_smtp);
   int ret = g_test_run ();
   g_mime_shutdown ();

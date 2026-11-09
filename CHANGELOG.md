@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.2.0
+
+Thunderbird-style mail tools.
+
+### Address book
+- Address Book page with your contacts and automatically collected addresses
+- Autocomplete in To, Cc and Bcc, ranked by favorites and how often you write to someone
+- Import contacts from vCard (2.1/3.0/4.0) and CSV (Thunderbird, Google, Outlook); export to vCard
+
+### Writing
+- Save drafts to the server (Ctrl+S, or when closing an unfinished message) and continue them later
+  with Edit Draft (Ctrl+E); saving again replaces the earlier copy, sending removes it
+- A signature for each account
+
+### Reading and organising
+- Search the whole folder on the server, including message text (press Enter in the search box)
+- Load older messages beyond the newest 100
+- Right-click menu on messages: Move To any folder, Mark as Junk / Not Junk, Save As File (.eml),
+  View Source, Print, and the usual reply/star/read/archive/delete actions
+- Folder actions: Mark All as Read, New Folder (also inside another folder), Rename, Delete
+- Import messages from .eml and mbox files (including Thunderbird folders) and export a folder as mbox
+- Open attachments with their usual app, or save them
+- Sub-folders are shown indented under their parent
+
+### Settings
+- Preferences: check for new mail every 1–60 minutes, new-mail notifications, and loading images
+  automatically from people you know
+- Backups now include contacts and signatures (older backups still restore)
+
+
 ## 0.1.1
 
 ### Arch Linux support

@@ -14,4 +14,8 @@ GtkWidget                  *smail_message_view_new        (void);
 void                        smail_message_view_set_detail (SMailMessageView *self, SMailMessageDetail *detail);
 const SMailMessageDetail *smail_message_view_get_detail (SMailMessageView *self);
 
+/* Load remote images for the next message without asking (trusted sender). */
+void                        smail_message_view_trust_next (SMailMessageView *self, gboolean trusted);
+void                        smail_message_view_print      (SMailMessageView *self);
+
 G_END_DECLS

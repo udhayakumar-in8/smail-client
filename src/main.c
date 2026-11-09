@@ -44,7 +44,13 @@ static const char *app_css =
   ".chat-messages row { background: transparent; padding: 3px 6px; }"
   ".bubble { padding: 8px 12px; border-radius: 16px; background: alpha(currentColor, 0.08); }"
   ".bubble.outgoing { background: @accent_bg_color; color: @accent_fg_color; }"
-  ".chat-compose { padding: 6px 12px; }";
+  ".chat-compose { padding: 6px 12px; }"
+  /* address book, drafts, lists */
+  "button.favorite-star image { color: #e5a50a; }"
+  "button.load-more { margin: 6px 12px 12px 12px; }"
+  ".signature-editor { min-height: 90px; }"
+  ".address-suggestions { min-width: 260px; }"
+  "menubutton.attachment > button { padding: 6px 12px; }";
 
 static void
 about_activated (GSimpleAction *a, GVariant *p, gpointer app)
@@ -71,16 +77,25 @@ static const char *shortcuts_ui =
   "<child><object class='GtkShortcutsShortcut'><property name='title'>Reply All</property><property name='accelerator'>&lt;Control&gt;&lt;Shift&gt;r</property></object></child>"
   "<child><object class='GtkShortcutsShortcut'><property name='title'>Forward</property><property name='accelerator'>&lt;Control&gt;l</property></object></child>"
   "<child><object class='GtkShortcutsShortcut'><property name='title'>Send (in composer)</property><property name='accelerator'>&lt;Control&gt;Return</property></object></child>"
+  "<child><object class='GtkShortcutsShortcut'><property name='title'>Save Draft (in composer)</property><property name='accelerator'>&lt;Control&gt;s</property></object></child>"
+  "<child><object class='GtkShortcutsShortcut'><property name='title'>Edit Draft</property><property name='accelerator'>&lt;Control&gt;e</property></object></child>"
+  "<child><object class='GtkShortcutsShortcut'><property name='title'>Save As File</property><property name='accelerator'>&lt;Control&gt;s</property></object></child>"
+  "<child><object class='GtkShortcutsShortcut'><property name='title'>View Source</property><property name='accelerator'>&lt;Control&gt;u</property></object></child>"
+  "<child><object class='GtkShortcutsShortcut'><property name='title'>Print</property><property name='accelerator'>&lt;Control&gt;p</property></object></child>"
   "</object></child>"
   "<child><object class='GtkShortcutsGroup'><property name='title'>Organize</property>"
   "<child><object class='GtkShortcutsShortcut'><property name='title'>Archive</property><property name='accelerator'>a</property></object></child>"
   "<child><object class='GtkShortcutsShortcut'><property name='title'>Move to Trash</property><property name='accelerator'>Delete</property></object></child>"
   "<child><object class='GtkShortcutsShortcut'><property name='title'>Star / Unstar</property><property name='accelerator'>s</property></object></child>"
   "<child><object class='GtkShortcutsShortcut'><property name='title'>Mark Read / Unread</property><property name='accelerator'>u</property></object></child>"
+  "<child><object class='GtkShortcutsShortcut'><property name='title'>Mark as Junk</property><property name='accelerator'>j</property></object></child>"
+  "<child><object class='GtkShortcutsShortcut'><property name='title'>Not Junk</property><property name='accelerator'>&lt;Shift&gt;j</property></object></child>"
+  "<child><object class='GtkShortcutsShortcut'><property name='title'>Mark All as Read</property><property name='accelerator'>&lt;Shift&gt;c</property></object></child>"
   "</object></child>"
   "<child><object class='GtkShortcutsGroup'><property name='title'>General</property>"
   "<child><object class='GtkShortcutsShortcut'><property name='title'>Search</property><property name='accelerator'>&lt;Control&gt;f</property></object></child>"
   "<child><object class='GtkShortcutsShortcut'><property name='title'>Refresh</property><property name='accelerator'>F5</property></object></child>"
+  "<child><object class='GtkShortcutsShortcut'><property name='title'>Preferences</property><property name='accelerator'>&lt;Control&gt;comma</property></object></child>"
   "<child><object class='GtkShortcutsShortcut'><property name='title'>Keyboard Shortcuts</property><property name='accelerator'>&lt;Control&gt;question</property></object></child>"
   "<child><object class='GtkShortcutsShortcut'><property name='title'>Quit</property><property name='accelerator'>&lt;Control&gt;q</property></object></child>"
   "</object></child></object></child></object></interface>";
@@ -97,12 +112,21 @@ shortcuts_activated (GSimpleAction *a, GVariant *p, gpointer app)
     { "Messages", "Reply All", "<Control><Shift>r" },
     { "Messages", "Forward", "<Control>l" },
     { "Messages", "Send (in composer)", "<Control>Return" },
+    { "Messages", "Save Draft (in composer)", "<Control>s" },
+    { "Messages", "Edit Draft", "<Control>e" },
+    { "Messages", "Save As File", "<Control>s" },
+    { "Messages", "View Source", "<Control>u" },
+    { "Messages", "Print", "<Control>p" },
     { "Organize", "Archive", "a" },
     { "Organize", "Move to Trash", "Delete" },
     { "Organize", "Star / Unstar", "s" },
     { "Organize", "Mark Read / Unread", "u" },
+    { "Organize", "Mark as Junk", "j" },
+    { "Organize", "Not Junk", "<Shift>j" },
+    { "Organize", "Mark All as Read", "<Shift>c" },
     { "General", "Search", "<Control>f" },
     { "General", "Refresh", "F5" },
+    { "General", "Preferences", "<Control>comma" },
     { "General", "Keyboard Shortcuts", "<Control>question" },
     { "General", "Quit", "<Control>q" },
   };
@@ -188,6 +212,14 @@ on_startup (GApplication *app)
     { "win.toggle-read",     { "u", NULL } },
     { "win.refresh",         { "F5", "<Control>F5", NULL } },
     { "win.search",          { "<Control>f", NULL } },
+    { "win.edit-draft",      { "<Control>e", NULL } },
+    { "win.print",           { "<Control>p", NULL } },
+    { "win.view-source",     { "<Control>u", NULL } },
+    { "win.save-message",    { "<Control>s", NULL } },
+    { "win.junk",            { "j", NULL } },
+    { "win.not-junk",        { "<Shift>j", NULL } },
+    { "win.mark-all-read",   { "<Shift>c", NULL } },
+    { "win.preferences",     { "<Control>comma", NULL } },
   };
   for (gsize i = 0; i < G_N_ELEMENTS (accels); i++)
     gtk_application_set_accels_for_action (GTK_APPLICATION (app), accels[i].action, accels[i].accels);

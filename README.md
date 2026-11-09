@@ -36,7 +36,7 @@ Your choice is remembered, and it is included in backups.
   and a strict Content-Security-Policy. **Remote images and tracking pixels are blocked** until
   you click *Show Images*. Inline `cid:` images and plain-text mail with linkified URLs and
   coloured quotes are supported. Dark mode applies to plain-text mail.
-- **Attachments**: shown with type icons and sizes; click one to save it.
+- **Attachments**: shown with type icons and sizes; click one to open or save it.
 - **Composer**: new message, reply, reply-all (removes your own address), and forward
   (keeps the original attachments). Supports Cc/Bcc, file attachments, and correct
   `In-Reply-To`/`References` threading headers. It asks before discarding a draft.
@@ -47,8 +47,43 @@ Your choice is remembered, and it is included in backups.
 - **Accounts**: multiple accounts, with presets for Gmail, Outlook, Yahoo, iCloud, Fastmail, Zoho and
   Proton Bridge, and a login test before saving. Passwords are stored in the system keyring
   (libsecret), never in the config file.
-- **Search** within the loaded folder, automatic refresh every 5 minutes, and keyboard shortcuts.
+- **Search** as you type, or on the server across the whole folder; automatic checks for new mail
+  (interval set in Preferences); keyboard shortcuts.
 - **Demo mode** (`--demo`) with sample mail, so you can try the app without an account.
+
+## Thunderbird-style mail tools (new in 0.2)
+
+| Address book & autocomplete | Drafts |
+|---|---|
+| ![](docs/autocomplete.png) | ![](docs/drafts.png) |
+| **Right-click menu** | **Search inside messages** |
+| ![](docs/context-menu.png) | ![](docs/search.png) |
+
+- **Address Book** (Organizer → Address Book): your contacts plus **collected addresses**. Like
+  Thunderbird, it remembers everyone you write to and everyone who writes to you. You can add,
+  edit, star (favorite) or delete contacts, and "Write Email" from any of them.
+- **Import and export contacts**: **vCard** (2.1/3.0/4.0, from Thunderbird, phones, Apple and
+  Google) and **CSV** (Thunderbird, Google and Outlook exports) in; vCard out.
+- **Autocomplete** in To, Cc and Bcc: start typing a name or address. Favorites and people you write
+  to often come first; ↑/↓ choose, Enter or Tab inserts, Esc closes.
+- **Drafts**: **Save Draft** (Ctrl+S, or when you close an unfinished message) stores the message
+  in the server's Drafts folder. **Edit Draft** (Ctrl+E) continues it later, on any computer. Saving
+  again replaces the earlier copy, and sending removes it.
+- **Signatures** per account (Account Settings), added to new messages, replies and forwards.
+- **Search the whole folder on the server**: typing filters the loaded list instantly, and **Enter**
+  searches every message in the folder, including the message text. **Load Older Messages** goes
+  past the newest 100.
+- **Right-click a message**: reply, star, read/unread, **Move To** any folder, archive, **Mark as
+  Junk / Not Junk**, delete, **Save As File** (.eml), **View Source** and **Print**. The same tools
+  are in the ⋮ menu above the message.
+- **Folders**: right-click a folder (or use the ⋮ menu above the list) for **Mark All as Read**,
+  **New Folder** (also inside another folder), **Rename**, **Delete**, **Import Messages** (.eml files
+  or **mbox**, including Thunderbird's folder files) and **Export Folder** as mbox. Sub-folders appear
+  indented under their parent.
+- **Attachments**: click one to **Open** it with its usual app or **Save As…**.
+- **Preferences** (Ctrl+,): how often to check for mail (every 1–60 minutes), new-mail
+  notifications, and whether images from people you know load automatically. Images from
+  everyone else stay blocked until you allow them.
 
 ## Downloaded emails are kept
 
@@ -182,6 +217,10 @@ These providers need IMAP turned on and, with two-factor authentication enabled,
 | Reply all | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd> | Star / unstar | <kbd>S</kbd> |
 | Forward | <kbd>Ctrl</kbd>+<kbd>L</kbd> | Mark read / unread | <kbd>U</kbd> |
 | Send (composer) | <kbd>Ctrl</kbd>+<kbd>Enter</kbd> | Search | <kbd>Ctrl</kbd>+<kbd>F</kbd> |
+| Save draft (composer) | <kbd>Ctrl</kbd>+<kbd>S</kbd> | Edit draft | <kbd>Ctrl</kbd>+<kbd>E</kbd> |
+| Mark as junk / not junk | <kbd>J</kbd> / <kbd>Shift</kbd>+<kbd>J</kbd> | Mark all as read | <kbd>Shift</kbd>+<kbd>C</kbd> |
+| View source | <kbd>Ctrl</kbd>+<kbd>U</kbd> | Print | <kbd>Ctrl</kbd>+<kbd>P</kbd> |
+| Save message as file | <kbd>Ctrl</kbd>+<kbd>S</kbd> | Preferences | <kbd>Ctrl</kbd>+<kbd>,</kbd> |
 | Refresh | <kbd>F5</kbd> | All shortcuts | <kbd>Ctrl</kbd>+<kbd>?</kbd> |
 
 ## Code layout
@@ -210,6 +249,10 @@ src/
   smail-backup.c          single-file backup and restore (SQLite)
   smail-backup-dialog.c   Backup & Restore dialog
   smail-theme.c           System / Matte White / Matte Black styles
+  smail-contacts-page.c   Address Book page
+  smail-address-completion.c  To/Cc/Bcc suggestions
+  smail-vcard.c           vCard / CSV contact import and export
+  smail-mbox.c            mbox reading and writing (message import/export)
 tests/test-imap.c         IMAP/SMTP/MIME tests (offline + live server)
 tests/test-local.c        database, filters, mail log and LAN chat tests
 tests/test-backup.c       downloaded-mail store and backup/restore round trips
@@ -260,9 +303,9 @@ and its `PKGBUILD`, the Ubuntu 24.04 `.deb`, `SHA256SUMS` and the changelog note
 ## Not yet implemented
 
 - OAuth2 login (Gmail/Outlook currently need app passwords)
-- Server-side search, plus paging past the newest 100 messages in a folder
-- Conversation threading, IMAP IDLE push (new mail is found by polling every 5 minutes)
-- Recurring calendar events, and import/export of calendars (iCalendar) and contacts
+- Conversation threading and selecting several messages at once
+- IMAP IDLE push (new mail is found by checking every 1–60 minutes)
+- Composing HTML (rich text) mail, PGP/S-MIME encryption
+- Recurring calendar events and iCalendar import/export
+- POP3 accounts, a unified inbox across accounts
 - Encrypted Local Chat, group chats and file transfer
-- Saving drafts to the server and composing HTML (rich text)
-- Offline cache: messages are fetched from the server each time
