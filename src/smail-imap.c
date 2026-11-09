@@ -532,6 +532,7 @@ smail_imap_list_folders (SMailImap *imap, GError **error)
       }
     }
     SMailFolder *f = smail_folder_new (name, display, role);
+    f->delimiter = g_strdup (delim);
 
     /* unread counter */
     g_autofree char *q = imap_quote_mailbox (name);
@@ -551,19 +552,14 @@ smail_imap_list_folders (SMailImap *imap, GError **error)
   return folders;
 }
 
-GPtrArray *
-smail_imap_list_messages (SMailImap *imap, const char *folder, guint limit, GError **error)
+/* Run a UID SEARCH (optionally with one literal argument) and return the UIDs, ascending. */
+static GArray *
+search_uids (SMailImap *imap, GBytes *literal, GError **error, const char *criteria)
 {
-  /* force a fresh SELECT so new mail is seen */
-  g_clear_pointer (&imap->selected, g_free);
-  if (!imap_select (imap, folder, error))
-    return NULL;
-
   g_autoptr (GPtrArray) resp = NULL;
-  if (!imap_command (imap, &resp, NULL, error, "UID SEARCH ALL"))
+  if (!imap_command (imap, &resp, literal, error, "UID SEARCH %s", criteria))
     return NULL;
-
-  g_autoptr (GArray) uids = g_array_new (FALSE, FALSE, sizeof (guint64));
+  GArray *uids = g_array_new (FALSE, FALSE, sizeof (guint64));
   for (guint i = 0; i < resp->len; i++) {
     ImapResponse *r = g_ptr_array_index (resp, i);
     if (g_ascii_strncasecmp (r->text->str, "* SEARCH", 8) != 0)
@@ -575,19 +571,33 @@ smail_imap_list_messages (SMailImap *imap, const char *folder, guint limit, GErr
         g_array_append_val (uids, u);
       }
   }
+  return uids;
+}
 
+static int
+compare_u64 (gconstpointer a, gconstpointer b)
+{
+  guint64 x = *(const guint64 *) a, y = *(const guint64 *) b;
+  return x < y ? -1 : x > y;
+}
+
+/* Fetch list summaries (headers + flags) for the newest `limit` of `uids`. */
+static GPtrArray *
+fetch_summaries (SMailImap *imap, GArray *uids, guint limit, GError **error)
+{
   GPtrArray *messages = g_ptr_array_new_with_free_func (g_object_unref);
   if (uids->len == 0)
     return messages;
+  g_array_sort (uids, compare_u64);
 
   guint start = uids->len > limit ? uids->len - limit : 0;
   GString *set = g_string_new (NULL);
   for (guint i = start; i < uids->len; i++)
     g_string_append_printf (set, "%s%" G_GUINT64_FORMAT, set->len ? "," : "", g_array_index (uids, guint64, i));
 
-  g_clear_pointer (&resp, g_ptr_array_unref);
+  g_autoptr (GPtrArray) resp = NULL;
   gboolean ok = imap_command (imap, &resp, NULL, error,
-                              "UID FETCH %s (UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE CONTENT-TYPE)])",
+                              "UID FETCH %s (UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM TO CC SUBJECT DATE CONTENT-TYPE)])",
                               set->str);
   g_string_free (set, TRUE);
   if (!ok) {
@@ -616,6 +626,83 @@ smail_imap_list_messages (SMailImap *imap, const char *folder, guint limit, GErr
                      smail_message_new_from_headers (uid, g_ptr_array_index (r->literals, 0), seen, flagged));
   }
   return messages;
+}
+
+GPtrArray *
+smail_imap_list_messages (SMailImap *imap, const char *folder, guint limit, GError **error)
+{
+  /* force a fresh SELECT so new mail is seen */
+  g_clear_pointer (&imap->selected, g_free);
+  if (!imap_select (imap, folder, error))
+    return NULL;
+  g_autoptr (GArray) uids = search_uids (imap, NULL, error, "ALL");
+  return uids ? fetch_summaries (imap, uids, limit, error) : NULL;
+}
+
+GPtrArray *
+smail_imap_search (SMailImap *imap, const char *folder, const char *query, guint limit, GError **error)
+{
+  g_clear_pointer (&imap->selected, g_free);
+  if (!imap_select (imap, folder, error))
+    return NULL;
+
+  /* TEXT matches headers and body. Plain ASCII goes in a quoted string;
+   * anything else is sent as a UTF-8 literal. */
+  gboolean ascii = TRUE;
+  for (const char *p = query; *p; p++)
+    if ((guchar) *p >= 0x7f || *p < 0x20)
+      ascii = FALSE;
+
+  g_autoptr (GArray) uids = NULL;
+  if (ascii) {
+    g_autofree char *q = imap_quote (query);
+    g_autofree char *criteria = g_strdup_printf ("TEXT %s", q);
+    uids = search_uids (imap, NULL, error, criteria);
+  } else {
+    g_autoptr (GBytes) lit = g_bytes_new (query, strlen (query));
+    g_autofree char *criteria = g_strdup_printf ("CHARSET UTF-8 TEXT {%" G_GSIZE_FORMAT "}", strlen (query));
+    uids = search_uids (imap, lit, error, criteria);
+  }
+  return uids ? fetch_summaries (imap, uids, limit, error) : NULL;
+}
+
+gboolean
+smail_imap_create_folder (SMailImap *imap, const char *name, GError **error)
+{
+  g_autofree char *q = imap_quote_mailbox (name);
+  if (!imap_command (imap, NULL, NULL, error, "CREATE %s", q))
+    return FALSE;
+  imap_command (imap, NULL, NULL, NULL, "SUBSCRIBE %s", q);
+  return TRUE;
+}
+
+gboolean
+smail_imap_rename_folder (SMailImap *imap, const char *from, const char *to, GError **error)
+{
+  g_autofree char *a = imap_quote_mailbox (from);
+  g_autofree char *b = imap_quote_mailbox (to);
+  /* a selected mailbox can't always be renamed: drop the selection first */
+  if (imap->selected && g_str_equal (imap->selected, from)) {
+    imap_command (imap, NULL, NULL, NULL, "CLOSE");
+    g_clear_pointer (&imap->selected, g_free);
+  }
+  if (!imap_command (imap, NULL, NULL, error, "RENAME %s %s", a, b))
+    return FALSE;
+  imap_command (imap, NULL, NULL, NULL, "UNSUBSCRIBE %s", a);
+  imap_command (imap, NULL, NULL, NULL, "SUBSCRIBE %s", b);
+  return TRUE;
+}
+
+gboolean
+smail_imap_delete_folder (SMailImap *imap, const char *name, GError **error)
+{
+  g_autofree char *q = imap_quote_mailbox (name);
+  if (imap->selected && g_str_equal (imap->selected, name)) {
+    imap_command (imap, NULL, NULL, NULL, "CLOSE");
+    g_clear_pointer (&imap->selected, g_free);
+  }
+  imap_command (imap, NULL, NULL, NULL, "UNSUBSCRIBE %s", q);
+  return imap_command (imap, NULL, NULL, error, "DELETE %s", q);
 }
 
 GBytes *

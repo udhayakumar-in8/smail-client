@@ -30,6 +30,11 @@ gboolean     smail_imap_store_flag    (SMailImap *imap, const char *folder, cons
 gboolean     smail_imap_move          (SMailImap *imap, const char *folder, const char *uid,
                                          const char *dest, GError **error);
 gboolean     smail_imap_delete        (SMailImap *imap, const char *folder, const char *uid, GError **error);
+GPtrArray   *smail_imap_search         (SMailImap *imap, const char *folder, const char *query,
+                                        guint limit, GError **error);           /* SMailMessage* */
+gboolean     smail_imap_create_folder  (SMailImap *imap, const char *name, GError **error);
+gboolean     smail_imap_rename_folder  (SMailImap *imap, const char *from, const char *to, GError **error);
+gboolean     smail_imap_delete_folder  (SMailImap *imap, const char *name, GError **error);
 gboolean     smail_imap_append        (SMailImap *imap, const char *folder, GBytes *message,
                                          const char *flags, GError **error);
 

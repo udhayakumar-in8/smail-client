@@ -18,6 +18,7 @@ typedef struct {
 struct _SMailDemoBackend {
   SMailBackend parent_instance;
   GHashTable    *folders; /* path -> GPtrArray<DemoMessage*> */
+  GPtrArray     *folder_list; /* SMailFolder*: the folders that exist */
   guint          next_uid;
 };
 
@@ -163,16 +164,28 @@ populate (SMailDemoBackend *self)
              "Order #4521 shipped", "Your order has shipped and should arrive Friday.", TRUE, FALSE);
 }
 
+static SMailFolder *
+demo_find_folder (SMailDemoBackend *self, const char *path, guint *index)
+{
+  for (guint i = 0; i < self->folder_list->len; i++) {
+    SMailFolder *f = g_ptr_array_index (self->folder_list, i);
+    if (g_str_equal (f->path, path)) {
+      if (index)
+        *index = i;
+      return f;
+    }
+  }
+  return NULL;
+}
+
 static GPtrArray *
 demo_list_folders (SMailBackend *backend, GError **error)
 {
   SMailDemoBackend *self = SMAIL_DEMO_BACKEND (backend);
   GPtrArray *folders = g_ptr_array_new_with_free_func ((GDestroyNotify) smail_folder_free);
-  for (gsize i = 0; i < G_N_ELEMENTS (demo_folders); i++) {
-    const char *display = demo_folders[i].path;
-    if (g_str_equal (display, "INBOX"))
-      display = "Inbox";
-    SMailFolder *f = smail_folder_new (demo_folders[i].path, display, demo_folders[i].role);
+  for (guint i = 0; i < self->folder_list->len; i++) {
+    SMailFolder *f = smail_folder_copy (g_ptr_array_index (self->folder_list, i));
+    f->unread = 0;
     GPtrArray *msgs = folder_messages (self, f->path);
     for (guint j = 0; j < msgs->len; j++)
       if (!((DemoMessage *) g_ptr_array_index (msgs, j))->seen)
@@ -267,12 +280,94 @@ demo_remove (SMailBackend *backend, const char *folder, const char *uid, GError 
 }
 
 static gboolean
-demo_append (SMailBackend *backend, const char *folder, GBytes *message, GError **error)
+demo_append (SMailBackend *backend, const char *folder, GBytes *message, const char *flags, GError **error)
 {
   SMailDemoBackend *self = SMAIL_DEMO_BACKEND (backend);
+  if (!demo_find_folder (self, folder, NULL)) {
+    g_set_error (error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND, "Folder “%s” doesn't exist", folder);
+    return FALSE;
+  }
   gsize len;
   const char *data = g_bytes_get_data (message, &len);
-  add_raw (self, folder, g_strndup (data, len), TRUE, FALSE);
+  add_raw (self, folder, g_strndup (data, len), flags && strstr (flags, "\\Seen"),
+           flags && strstr (flags, "\\Flagged"));
+  return TRUE;
+}
+
+static GPtrArray *
+demo_search (SMailBackend *backend, const char *folder, const char *query, guint limit, GError **error)
+{
+  SMailDemoBackend *self = SMAIL_DEMO_BACKEND (backend);
+  GPtrArray *msgs = folder_messages (self, folder);
+  GPtrArray *out = g_ptr_array_new_with_free_func (g_object_unref);
+  g_autofree char *q = g_utf8_casefold (query, -1);
+  for (gint i = msgs->len - 1; i >= 0 && out->len < limit; i--) {
+    DemoMessage *m = g_ptr_array_index (msgs, i);
+    g_autoptr (SMailMessageDetail) d = smail_message_detail_parse ("", m->raw, NULL);
+    g_autofree char *hay = g_strjoin ("\n", d ? d->subject : "", d && d->from_name ? d->from_name : "",
+                                      d && d->from_addr ? d->from_addr : "", d && d->to ? d->to : "",
+                                      d && d->text ? d->text : "", d && d->html ? d->html : "", NULL);
+    g_autofree char *h = g_utf8_casefold (hay, -1);
+    if (strstr (h, q)) {
+      g_autofree char *uid = g_strdup_printf ("%u", m->uid);
+      g_ptr_array_add (out, smail_message_new_from_headers (uid, m->raw, m->seen, m->flagged));
+    }
+  }
+  return out;
+}
+
+static gboolean
+demo_create_folder (SMailBackend *backend, const char *name, GError **error)
+{
+  SMailDemoBackend *self = SMAIL_DEMO_BACKEND (backend);
+  if (demo_find_folder (self, name, NULL)) {
+    g_set_error (error, G_IO_ERROR, G_IO_ERROR_EXISTS, "A folder named “%s” already exists", name);
+    return FALSE;
+  }
+  const char *slash = strrchr (name, '/');
+  SMailFolder *f = smail_folder_new (name, slash ? slash + 1 : name, NULL);
+  f->delimiter = g_strdup ("/");
+  g_ptr_array_add (self->folder_list, f);
+  folder_messages (self, name);
+  return TRUE;
+}
+
+static gboolean
+demo_rename_folder (SMailBackend *backend, const char *from, const char *to, GError **error)
+{
+  SMailDemoBackend *self = SMAIL_DEMO_BACKEND (backend);
+  SMailFolder *f = demo_find_folder (self, from, NULL);
+  if (!f || f->role) {
+    g_set_error (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "This folder can't be renamed");
+    return FALSE;
+  }
+  if (demo_find_folder (self, to, NULL)) {
+    g_set_error (error, G_IO_ERROR, G_IO_ERROR_EXISTS, "A folder named “%s” already exists", to);
+    return FALSE;
+  }
+  GPtrArray *msgs = g_ptr_array_ref (folder_messages (self, from));
+  g_hash_table_remove (self->folders, from);
+  g_hash_table_insert (self->folders, g_strdup (to), msgs);
+  g_free (f->path);
+  f->path = g_strdup (to);
+  const char *slash = strrchr (to, '/');
+  g_free (f->display_name);
+  f->display_name = g_strdup (slash ? slash + 1 : to);
+  return TRUE;
+}
+
+static gboolean
+demo_delete_folder (SMailBackend *backend, const char *name, GError **error)
+{
+  SMailDemoBackend *self = SMAIL_DEMO_BACKEND (backend);
+  guint idx;
+  SMailFolder *f = demo_find_folder (self, name, &idx);
+  if (!f || f->role) {
+    g_set_error (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "This folder can't be deleted");
+    return FALSE;
+  }
+  g_hash_table_remove (self->folders, name);
+  g_ptr_array_remove_index (self->folder_list, idx);
   return TRUE;
 }
 
@@ -288,6 +383,7 @@ static void
 smail_demo_backend_finalize (GObject *object)
 {
   g_hash_table_unref (SMAIL_DEMO_BACKEND (object)->folders);
+  g_ptr_array_unref (SMAIL_DEMO_BACKEND (object)->folder_list);
   G_OBJECT_CLASS (smail_demo_backend_parent_class)->finalize (object);
 }
 
@@ -303,12 +399,23 @@ smail_demo_backend_class_init (SMailDemoBackendClass *klass)
   bc->move = demo_move;
   bc->remove = demo_remove;
   bc->append = demo_append;
+  bc->search = demo_search;
+  bc->create_folder = demo_create_folder;
+  bc->rename_folder = demo_rename_folder;
+  bc->delete_folder = demo_delete_folder;
   bc->send = demo_send;
 }
 
 static void
 smail_demo_backend_init (SMailDemoBackend *self)
 {
+  self->folder_list = g_ptr_array_new_with_free_func ((GDestroyNotify) smail_folder_free);
+  for (gsize i = 0; i < G_N_ELEMENTS (demo_folders); i++) {
+    const char *path = demo_folders[i].path;
+    SMailFolder *f = smail_folder_new (path, g_str_equal (path, "INBOX") ? "Inbox" : path, demo_folders[i].role);
+    f->delimiter = g_strdup ("/");
+    g_ptr_array_add (self->folder_list, f);
+  }
   self->folders = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify) g_ptr_array_unref);
   self->next_uid = 1;
   populate (self);

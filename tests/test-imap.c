@@ -251,6 +251,52 @@ test_imap (void)
   g_assert_no_error (error);
   g_assert_cmpuint (count_in (imap, "Café Ünïcode"), ==, 1);
 
+  /* SEARCH: ASCII and UTF-8 (sent as a literal), body and header text */
+  {
+    g_autoptr (GPtrArray) hits = smail_imap_search (imap, "INBOX", "body", 50, &error);
+    g_assert_no_error (error);
+    g_assert_cmpuint (hits->len, ==, 1);
+    g_autoptr (GPtrArray) none2 = smail_imap_search (imap, "INBOX", "no-such-words", 50, &error);
+    g_assert_cmpuint (none2->len, ==, 0);
+    g_autoptr (GPtrArray) utf = smail_imap_search (imap, "INBOX", "Grüße", 50, &error);
+    g_assert_no_error (error);
+    g_assert_cmpuint (utf->len, ==, 1);
+    g_assert_cmpstr (((SMailMessage *) g_ptr_array_index (utf, 0))->subject, ==, "Grüße");
+  }
+
+  /* CREATE / RENAME / DELETE, with a sub-folder and an APPEND carrying flags */
+  {
+    smail_imap_delete_folder (imap, "Projects/2027", NULL);
+    smail_imap_delete_folder (imap, "Projects/2026", NULL);
+    smail_imap_delete_folder (imap, "Projects", NULL);
+    g_assert_true (smail_imap_create_folder (imap, "Projects/2026", &error));
+    g_assert_no_error (error);
+    g_assert_true (smail_imap_append (imap, "Projects/2026", m1, "\\Draft \\Seen", &error));
+    g_assert_no_error (error);
+    g_assert_true (smail_imap_rename_folder (imap, "Projects/2026", "Projects/2027", &error));
+    g_assert_no_error (error);
+    g_autoptr (GPtrArray) moved = smail_imap_list_messages (imap, "Projects/2027", 10, &error);
+    g_assert_no_error (error);
+    g_assert_cmpuint (moved->len, ==, 1);
+    g_assert_true (((SMailMessage *) g_ptr_array_index (moved, 0))->seen);
+    g_autoptr (GPtrArray) after = smail_imap_list_folders (imap, &error);
+    gboolean found = FALSE;
+    for (guint i = 0; i < after->len; i++) {
+      SMailFolder *f = g_ptr_array_index (after, i);
+      if (g_str_equal (f->path, "Projects/2027")) {
+        found = TRUE;
+        g_assert_cmpstr (f->display_name, ==, "2027");
+        g_assert_cmpstr (f->delimiter, ==, "/");
+      }
+      g_assert_cmpstr (f->path, !=, "Projects/2026");
+    }
+    g_assert_true (found);
+    g_assert_true (smail_imap_delete_folder (imap, "Projects/2027", &error));
+    g_assert_no_error (error);
+    g_assert_false (smail_imap_create_folder (imap, "INBOX", &error));  /* already exists */
+    g_clear_error (&error);
+  }
+
   /* server NO on a missing folder */
   g_autoptr (GPtrArray) none = smail_imap_list_messages (imap, "Does Not Exist", 10, &error);
   g_assert_null (none);

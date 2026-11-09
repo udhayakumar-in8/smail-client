@@ -71,6 +71,7 @@ smail_folder_copy (const SMailFolder *src)
 {
   SMailFolder *f = smail_folder_new (src->path, src->display_name, src->role);
   f->unread = src->unread;
+  f->delimiter = g_strdup (src->delimiter);
   return f;
 }
 
@@ -82,6 +83,7 @@ smail_folder_free (SMailFolder *f)
   g_free (f->path);
   g_free (f->display_name);
   g_free (f->role);
+  g_free (f->delimiter);
   g_free (f);
 }
 

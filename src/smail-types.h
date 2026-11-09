@@ -38,6 +38,7 @@ typedef struct {
   char *path;          /* server name, decoded UTF-8 */
   char *display_name;
   char *role;          /* "inbox", "sent", "trash", ... or NULL */
+  char *delimiter;     /* hierarchy separator, e.g. "/" (may be NULL) */
   int   unread;
 } SMailFolder;
 

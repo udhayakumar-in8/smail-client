@@ -82,6 +82,11 @@ typedef enum {
   JOB_TRASH,
   JOB_MOVE,
   JOB_SEND,
+  JOB_SEARCH,
+  JOB_APPEND,
+  JOB_CREATE_FOLDER,
+  JOB_RENAME_FOLDER,
+  JOB_DELETE_FOLDER,
 } JobKind;
 
 typedef struct {
@@ -193,12 +198,36 @@ run_job (GTask *task, gpointer source, gpointer task_data, GCancellable *cancell
     else if (klass->move (self, job->folder, job->uid, job->flag, &error))
       g_task_return_boolean (task, TRUE);
     break;
+  case JOB_SEARCH: {
+    GPtrArray *msgs = klass->search (self, job->folder, job->flag, job->limit, &error);
+    if (msgs) {
+      g_ptr_array_sort (msgs, compare_newest_first);
+      g_task_return_pointer (task, msgs, (GDestroyNotify) g_ptr_array_unref);
+    }
+    break;
+  }
+  case JOB_APPEND:
+    if (klass->append (self, job->folder, job->message, job->flag, &error))
+      g_task_return_boolean (task, TRUE);
+    break;
+  case JOB_CREATE_FOLDER:
+    if (klass->create_folder (self, job->folder, &error))
+      g_task_return_boolean (task, TRUE);
+    break;
+  case JOB_RENAME_FOLDER:
+    if (klass->rename_folder (self, job->folder, job->flag, &error))
+      g_task_return_boolean (task, TRUE);
+    break;
+  case JOB_DELETE_FOLDER:
+    if (klass->delete_folder (self, job->folder, &error))
+      g_task_return_boolean (task, TRUE);
+    break;
   case JOB_SEND:
     if (klass->send (self, job->message, job->from, (const char * const *) job->recipients, &error)) {
       const SMailFolder *sent = smail_backend_find_role (self, "sent");
       if (sent && !klass->saves_sent (self)) {
         g_autoptr (GError) append_error = NULL;
-        if (!klass->append (self, sent->path, job->message, &append_error))
+        if (!klass->append (self, sent->path, job->message, "\\Seen", &append_error))
           g_warning ("Message sent but not saved to %s: %s", sent->path, append_error->message);
       }
       g_task_return_boolean (task, TRUE);
@@ -308,6 +337,65 @@ smail_backend_send (SMailBackend *self, GBytes *message, const char *from,
   job->from = g_strdup (from);
   job->recipients = g_strdupv ((char **) recipients);
   start_job (self, job, NULL, cb, data);
+}
+
+static Job *
+new_job (JobKind kind, const char *folder, const char *arg)
+{
+  Job *job = g_new0 (Job, 1);
+  job->kind = kind;
+  job->folder = g_strdup (folder);
+  job->flag = g_strdup (arg);   /* query / flags / new name, depending on kind */
+  return job;
+}
+
+void
+smail_backend_search (SMailBackend *self, const char *folder, const char *query, guint limit,
+                      GCancellable *c, GAsyncReadyCallback cb, gpointer data)
+{
+  Job *job = new_job (JOB_SEARCH, folder, query);
+  job->limit = limit;
+  start_job (self, job, c, cb, data);
+}
+
+void
+smail_backend_append (SMailBackend *self, const char *folder, GBytes *message, const char *flags,
+                      GAsyncReadyCallback cb, gpointer data)
+{
+  Job *job = new_job (JOB_APPEND, folder, flags ? flags : "");
+  job->message = g_bytes_ref (message);
+  start_job (self, job, NULL, cb, data);
+}
+
+void
+smail_backend_create_folder (SMailBackend *self, const char *name, GAsyncReadyCallback cb, gpointer data)
+{
+  start_job (self, new_job (JOB_CREATE_FOLDER, name, NULL), NULL, cb, data);
+}
+
+void
+smail_backend_rename_folder (SMailBackend *self, const char *from, const char *to,
+                             GAsyncReadyCallback cb, gpointer data)
+{
+  start_job (self, new_job (JOB_RENAME_FOLDER, from, to), NULL, cb, data);
+}
+
+void
+smail_backend_delete_folder (SMailBackend *self, const char *name, GAsyncReadyCallback cb, gpointer data)
+{
+  start_job (self, new_job (JOB_DELETE_FOLDER, name, NULL), NULL, cb, data);
+}
+
+const char *
+smail_backend_get_delimiter (SMailBackend *self)
+{
+  SMailBackendPrivate *priv = smail_backend_get_instance_private (self);
+  for (guint i = 0; priv->folders && i < priv->folders->len; i++) {
+    SMailFolder *f = g_ptr_array_index (priv->folders, i);
+    if (f->delimiter && *f->delimiter)
+      return f->delimiter;
+  }
+  return "/";
 }
 
 gpointer
@@ -426,11 +514,47 @@ imap_remove (SMailBackend *backend, const char *folder, const char *uid, GError 
 }
 
 static gboolean
-imap_append (SMailBackend *backend, const char *folder, GBytes *message, GError **error)
+imap_append (SMailBackend *backend, const char *folder, GBytes *message, const char *flags, GError **error)
 {
   SMailImapBackend *self = SMAIL_IMAP_BACKEND (backend);
   gboolean res = FALSE;
-  WITH_RETRY (res, smail_imap_append (imap, folder, message, "\\Seen", error_));
+  WITH_RETRY (res, smail_imap_append (imap, folder, message, flags, error_));
+  return res;
+}
+
+static GPtrArray *
+imap_search (SMailBackend *backend, const char *folder, const char *query, guint limit, GError **error)
+{
+  SMailImapBackend *self = SMAIL_IMAP_BACKEND (backend);
+  GPtrArray *res = NULL;
+  WITH_RETRY (res, smail_imap_search (imap, folder, query, limit, error_));
+  return res;
+}
+
+static gboolean
+imap_create_folder (SMailBackend *backend, const char *name, GError **error)
+{
+  SMailImapBackend *self = SMAIL_IMAP_BACKEND (backend);
+  gboolean res = FALSE;
+  WITH_RETRY (res, smail_imap_create_folder (imap, name, error_));
+  return res;
+}
+
+static gboolean
+imap_rename_folder (SMailBackend *backend, const char *from, const char *to, GError **error)
+{
+  SMailImapBackend *self = SMAIL_IMAP_BACKEND (backend);
+  gboolean res = FALSE;
+  WITH_RETRY (res, smail_imap_rename_folder (imap, from, to, error_));
+  return res;
+}
+
+static gboolean
+imap_delete_folder (SMailBackend *backend, const char *name, GError **error)
+{
+  SMailImapBackend *self = SMAIL_IMAP_BACKEND (backend);
+  gboolean res = FALSE;
+  WITH_RETRY (res, smail_imap_delete_folder (imap, name, error_));
   return res;
 }
 
@@ -469,6 +593,10 @@ smail_imap_backend_class_init (SMailImapBackendClass *klass)
   bc->move = imap_move;
   bc->remove = imap_remove;
   bc->append = imap_append;
+  bc->search = imap_search;
+  bc->create_folder = imap_create_folder;
+  bc->rename_folder = imap_rename_folder;
+  bc->delete_folder = imap_delete_folder;
   bc->send = imap_send;
   bc->saves_sent = imap_saves_sent;
 }

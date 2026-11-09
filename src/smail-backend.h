@@ -20,7 +20,13 @@ struct _SMailBackendClass {
   gboolean   (*move)          (SMailBackend *self, const char *folder, const char *uid,
                                const char *dest, GError **error);
   gboolean   (*remove)        (SMailBackend *self, const char *folder, const char *uid, GError **error);
-  gboolean   (*append)        (SMailBackend *self, const char *folder, GBytes *message, GError **error);
+  gboolean   (*append)        (SMailBackend *self, const char *folder, GBytes *message,
+                               const char *flags, GError **error);
+  GPtrArray *(*search)        (SMailBackend *self, const char *folder, const char *query,
+                               guint limit, GError **error);
+  gboolean   (*create_folder) (SMailBackend *self, const char *name, GError **error);
+  gboolean   (*rename_folder) (SMailBackend *self, const char *from, const char *to, GError **error);
+  gboolean   (*delete_folder) (SMailBackend *self, const char *name, GError **error);
   gboolean   (*send)          (SMailBackend *self, GBytes *message, const char *from,
                                const char * const *recipients, GError **error);
   /* Whether the server files sent mail on its own (Gmail, Outlook...) */
@@ -57,6 +63,20 @@ void       smail_backend_trash         (SMailBackend *self, const char *folder, 
 void       smail_backend_send          (SMailBackend *self, GBytes *message, const char *from,
                                           const char * const *recipients,
                                           GAsyncReadyCallback cb, gpointer data);
+
+/* search -> GPtrArray<SMailMessage*>; the rest -> gboolean */
+void       smail_backend_search          (SMailBackend *self, const char *folder, const char *query, guint limit,
+                                          GCancellable *c, GAsyncReadyCallback cb, gpointer data);
+void       smail_backend_append          (SMailBackend *self, const char *folder, GBytes *message,
+                                          const char *flags, GAsyncReadyCallback cb, gpointer data);
+void       smail_backend_create_folder   (SMailBackend *self, const char *name,
+                                          GAsyncReadyCallback cb, gpointer data);
+void       smail_backend_rename_folder   (SMailBackend *self, const char *from, const char *to,
+                                          GAsyncReadyCallback cb, gpointer data);
+void       smail_backend_delete_folder   (SMailBackend *self, const char *name,
+                                          GAsyncReadyCallback cb, gpointer data);
+/* Folder separator used by the server ("/" or "."), known after list_folders. */
+const char *smail_backend_get_delimiter  (SMailBackend *self);
 
 gpointer   smail_backend_finish_pointer (SMailBackend *self, GAsyncResult *res, GError **error);
 gboolean   smail_backend_finish_boolean (SMailBackend *self, GAsyncResult *res, GError **error);
